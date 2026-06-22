@@ -1,0 +1,14 @@
+{
+  "cameras": [
+    {
+      "name": "Front Door",
+      "url": "rtsp://192.168.0.10:554/live"
+    },
+    {
+      "name": "Backyard",
+      "url": "rtsp://192.168.0.11:554/stream1",
+      "username": "admin",
+      "password": "your-password"
+    }
+  ]
+}

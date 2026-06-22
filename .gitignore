@@ -1,0 +1,24 @@
+# --- Personal / Claude Code working files (not part of the codebase) ---
+.claude/
+CLAUDE.md
+STATUS.md
+
+# --- Credentials: real camera config (use cameras.example.json as the template) ---
+cameras.json
+
+# --- Build artifacts ---
+.build/
+native/.build/
+native/build/
+.venv/
+
+# --- Icon generation intermediates (AppIcon.icns is committed) ---
+native/AppIcon.iconset/
+native/icon_1024.png
+
+# --- Python ---
+__pycache__/
+*.pyc
+
+# --- macOS ---
+.DS_Store

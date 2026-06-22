@@ -1,0 +1,12 @@
+[project]
+name = "localvideo"
+version = "0.1.0"
+description = "Lightweight low-latency RTSP multi-camera viewer for local networks"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "PySide6>=6.8",
+    "python-vlc>=3.0",
+    "opencv-python>=4.8",
+    "numpy>=1.24",
+]
