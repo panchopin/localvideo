@@ -10,15 +10,10 @@ cameras.json
 .build/
 native/.build/
 native/build/
-.venv/
 
 # --- Icon generation intermediates (AppIcon.icns is committed) ---
 native/AppIcon.iconset/
 native/icon_1024.png
-
-# --- Python ---
-__pycache__/
-*.pyc
 
 # --- macOS ---
 .DS_Store

@@ -154,7 +154,8 @@ Easiest path: launch the app and use **Preferences (`⌘,`)** — add cameras ma
 
 ---
 
-## Note on the Python viewer
+## Note on earlier engines
 
-`viewer.py` (OpenCV) and `viewer_vlc.py` (VLC) are **superseded** earlier engines, kept as
-reference for the latency journey above. The native app in `native/` is the real product.
+This project passed through Python/OpenCV and VLC prototypes before the native rewrite
+(see the journey table above). Those prototypes have been removed — the native app in
+`native/` is the product. The lesson they taught is preserved in this README.
