@@ -45,10 +45,19 @@ final class GridContainerView: NSView {
         let tileW = (bounds.width - spacing * CGFloat(cols - 1)) / CGFloat(cols)
         let tileH = (bounds.height - spacing * CGFloat(rows - 1)) / CGFloat(rows)
 
+        // Center a non-full last row so the orphan tile(s) sit balanced under
+        // the rows above (e.g. 3 cameras → 2 on top, 1 centered below) instead
+        // of leaving a gap on the right. Tiles keep the same size as the others.
+        let lastRowCount = n % cols == 0 ? cols : n % cols
+        let lastRowOffsetX = lastRowCount == cols
+            ? 0
+            : (bounds.width - CGFloat(lastRowCount) * tileW - spacing * CGFloat(lastRowCount - 1)) / 2
+
         for (i, tile) in tiles.enumerated() {
             let r = i / cols
             let c = i % cols
-            let x = CGFloat(c) * (tileW + spacing)
+            let isLastRow = r == rows - 1
+            let x = (isLastRow ? lastRowOffsetX : 0) + CGFloat(c) * (tileW + spacing)
             // Flip rows for AppKit's bottom-left origin so tile 0 is top-left.
             let y = bounds.height - CGFloat(r + 1) * tileH - CGFloat(r) * spacing
             tile.frame = NSRect(x: x, y: y, width: tileW, height: tileH)

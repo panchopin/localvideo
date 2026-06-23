@@ -15,11 +15,10 @@ import AVFoundation
 
 let maxCameras = 9
 
-/// Auto column count for N cameras: nearly-square via ceil(sqrt(N)), with a
-/// wide row for the 3-camera case (looks better than 2×2 with a hole).
+/// Auto column count for N cameras: nearly-square via ceil(sqrt(N)). A non-full
+/// last row is centered by GridContainerView, so e.g. 3 → 2-over-1-centered.
 func autoColumns(_ n: Int) -> Int {
     guard n > 0 else { return 1 }
-    if n == 3 { return 3 }
     return max(1, Int(Double(n).squareRoot().rounded(.up)))
 }
 
