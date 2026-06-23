@@ -208,8 +208,12 @@ final class PreferencesWindowController: NSWindowController, NSTableViewDataSour
         if list.contains(where: { $0.id != id && $0.name == name }) {
             return showError("Another camera already uses that name.")
         }
-        if !url.hasPrefix("rtsp://") || url.count <= 7 {
-            return showError("URL must start with rtsp:// and include a host.")
+        let lowerURL = url.lowercased()
+        if !(lowerURL.hasPrefix("rtsp://") || lowerURL.hasPrefix("rtsps://")) {
+            return showError("URL must start with rtsp:// or rtsps://.")
+        }
+        if URL(string: url)?.host == nil {
+            return showError("URL must include a host, e.g. rtsps://192.168.0.10:7441/live")
         }
         if user.isEmpty != pass.isEmpty {
             return showError("Set both username and password, or neither.")

@@ -41,14 +41,19 @@ struct CameraConfig: Codable, Equatable {
         try c.encodeIfPresent(password, forKey: .password)
     }
 
-    /// Full RTSP URL with credentials inserted if they were supplied separately.
+    /// Full RTSP(S) URL with credentials inserted if they were supplied
+    /// separately. Handles both rtsp:// and rtsps:// schemes.
     var resolvedURL: String {
         guard let user = username, !user.isEmpty,
               let pass = password, !pass.isEmpty else { return url }
-        guard let range = url.range(of: "rtsp://") else { return url }
-        var result = url
-        result.replaceSubrange(range, with: "rtsp://\(user):\(pass)@")
-        return result
+        for scheme in ["rtsps://", "rtsp://"] {
+            if let range = url.range(of: scheme, options: .caseInsensitive) {
+                var result = url
+                result.replaceSubrange(range, with: "\(scheme)\(user):\(pass)@")
+                return result
+            }
+        }
+        return url
     }
 }
 
