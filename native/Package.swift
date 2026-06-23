@@ -8,6 +8,12 @@ let package = Package(
         .executableTarget(
             name: "LocalVideoNative",
             path: "Sources/LocalVideoNative"
+        ),
+        // Diagnostic latency probe (Tool A: stream drift + FPS). Separate target so
+        // it never touches the app's render path. See docs/STREAM_LATENCY_EVALUATION.md.
+        .executableTarget(
+            name: "latency-probe",
+            path: "Sources/LatencyProbe"
         )
     ],
     // Phase 1 uses background pipe reads + main-thread UI hops; Swift 5 language
