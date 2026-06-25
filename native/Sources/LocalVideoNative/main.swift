@@ -39,6 +39,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var tilesById: [UUID: CameraTileView] = [:]
     private var sources: [UUID: RTSPSource] = [:]
 
+    // Stream-health tracking (all touched on the main thread).
+    private var lastFrameAt: [UUID: Date] = [:]
+    private var sourceStartedAt: [UUID: Date] = [:]
+    private var lastKickAt: [UUID: Date] = [:]
+    private var healthTimer: Timer?
+
+    private let freshWindow: TimeInterval = 3    // frames within 3s → green
+    private let staleWindow: TimeInterval = 8    // no frames 3–8s → yellow; >8s → red
+    private let connectGrace: TimeInterval = 12  // allow this long for the first frame
+    private let kickCooldown: TimeInterval = 15  // min gap between auto-reconnects
+
     private var layoutMode: LayoutMode = .auto
     private var prefsController: PreferencesWindowController?
 
@@ -95,10 +106,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             openPreferences()
         }
 
+        startHealthTimer()
         NSApp.activate(ignoringOtherApps: true)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        healthTimer?.invalidate()
         sources.values.forEach { $0.stop() }
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
     }
@@ -133,17 +146,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                 if old.name != cam.name { tile.updateName(cam.name) }
                 if old.resolvedURL != cam.resolvedURL {
                     sources[cam.id]?.stop()
-                    let source = makeSource(cam)
-                    sources[cam.id] = source
-                    source.start()
+                    startCamera(cam)
                 }
                 orderedTiles.append(tile)
             } else {
                 let tile = CameraTileView(name: cam.name)
+                tile.onKick = { [weak self] in self?.reconnect(id: cam.id) }
                 tilesById[cam.id] = tile
-                let source = makeSource(cam)
-                sources[cam.id] = source
-                source.start()
+                startCamera(cam)
                 orderedTiles.append(tile)
             }
         }
@@ -160,18 +170,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let source = RTSPSource(url: camera.resolvedURL)
         let id = camera.id
         source.onSampleBuffer = { [weak self] sb in
-            DispatchQueue.main.async { self?.tilesById[id]?.video.enqueue(sb) }
+            DispatchQueue.main.async {
+                self?.lastFrameAt[id] = Date()   // freshness signal
+                self?.tilesById[id]?.video.enqueue(sb)
+            }
         }
         source.onStatus = { [weak self] status in
-            DispatchQueue.main.async { self?.setStatus(status, for: id) }
+            // ffmpeg exited — fail fast and reconnect now (the health timer
+            // separately catches silent stalls where ffmpeg stays alive).
+            guard status == .failed else { return }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.setStatus(.failed, for: id)
+                if Date().timeIntervalSince(self.lastKickAt[id] ?? .distantPast) >= self.kickCooldown {
+                    self.reconnect(id: id)
+                }
+            }
         }
         return source
     }
 
+    /// Create + start a source for one camera and reset its health trackers.
+    private func startCamera(_ cam: CameraConfig) {
+        let source = makeSource(cam)
+        sources[cam.id] = source
+        sourceStartedAt[cam.id] = Date()
+        lastFrameAt[cam.id] = nil
+        source.start()
+    }
+
+    /// Force a fresh connection for one camera (manual kick button, or auto on stall).
+    func reconnect(id: UUID) {
+        guard let cam = cameras.first(where: { $0.id == id }) else { return }
+        sources[id]?.stop()
+        tilesById[id]?.video.flushDisplay()
+        lastKickAt[id] = Date()
+        setStatus(.connecting, for: id)
+        startCamera(cam)
+    }
+
     private func setStatus(_ status: StreamStatus, for id: UUID) {
+        guard statuses[id] != status else { return }   // avoid 1 Hz churn
         statuses[id] = status
         tilesById[id]?.setStatus(status)
         prefsController?.refreshStatus(for: id)
+    }
+
+    // MARK: - Stream health (freshness → status + auto-reconnect)
+
+    private func startHealthTimer() {
+        healthTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.checkHealth()
+        }
+    }
+
+    /// Derive each camera's status from how recently a frame arrived, and
+    /// auto-kick a stalled stream (with a cooldown so we don't thrash).
+    private func checkHealth() {
+        let now = Date()
+        for cam in cameras {
+            let id = cam.id
+            let status: StreamStatus
+            if let last = lastFrameAt[id] {
+                let age = now.timeIntervalSince(last)
+                status = age <= freshWindow ? .streaming : (age <= staleWindow ? .connecting : .failed)
+            } else {
+                // No frame yet since (re)connect — grace period, then treat as failed.
+                let waited = now.timeIntervalSince(sourceStartedAt[id] ?? now)
+                status = waited <= connectGrace ? .connecting : .failed
+            }
+            setStatus(status, for: id)
+
+            if status == .failed, now.timeIntervalSince(lastKickAt[id] ?? .distantPast) >= kickCooldown {
+                reconnect(id: id)   // auto-reconnect stalled/dead stream
+            }
+        }
     }
 
     private func persist() {

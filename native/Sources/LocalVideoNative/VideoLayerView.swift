@@ -32,6 +32,12 @@ final class VideoLayerView: NSView {
         displayLayer.frame = bounds
     }
 
+    /// Clear the currently displayed frame (e.g. on reconnect) so a stalled
+    /// image doesn't linger while the new connection comes up.
+    func flushDisplay() {
+        displayLayer.flushAndRemoveImage()
+    }
+
     /// Enqueue a decoded-ready sample buffer for immediate display.
     /// Must be called on the main thread.
     func enqueue(_ sampleBuffer: CMSampleBuffer) {

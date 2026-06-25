@@ -1,13 +1,18 @@
 import AppKit
 
-/// A single grid cell: the native video layer plus a bottom-left overlay with a
-/// status dot and the camera name.
+/// A single grid cell: the native video layer, a bottom-left status dot + name
+/// overlay, and a bottom-right reconnect ("kick") button that appears on hover.
 final class CameraTileView: NSView {
 
     let video = VideoLayerView(frame: .zero)
     private let nameLabel = NSTextField(labelWithString: "")
     private let statusDot = NSView()
+    private let kickButton = NSButton()
     private var status: StreamStatus = .connecting
+    private var hoverArea: NSTrackingArea?
+
+    /// Invoked when the user clicks the reconnect button.
+    var onKick: (() -> Void)?
 
     init(name: String) {
         super.init(frame: .zero)
@@ -35,6 +40,16 @@ final class CameraTileView: NSView {
         nameLabel.isEditable = false
         nameLabel.lineBreakMode = .byTruncatingTail
         addSubview(nameLabel)
+
+        kickButton.isHidden = true
+        kickButton.bezelStyle = .circular
+        kickButton.imagePosition = .imageOnly
+        kickButton.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Reconnect")
+        if kickButton.image == nil { kickButton.title = "⟳" }
+        kickButton.toolTip = "Reconnect this camera"
+        kickButton.target = self
+        kickButton.action = #selector(kickTapped)
+        addSubview(kickButton)
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
@@ -47,14 +62,35 @@ final class CameraTileView: NSView {
         let dotSize: CGFloat = 8
         nameLabel.sizeToFit()
         let labelH = nameLabel.frame.height + 4
-        // AppKit origin is bottom-left → keep the overlay in the bottom corner.
         statusDot.frame = NSRect(x: pad, y: pad + (labelH - dotSize) / 2, width: dotSize, height: dotSize)
 
         let labelX = pad + dotSize + 4
-        let maxW = bounds.width - labelX - pad
-        let w = min(nameLabel.frame.width + 10, max(0, maxW))
-        nameLabel.frame = NSRect(x: labelX, y: pad, width: w, height: labelH)
+        let labelW = min(nameLabel.frame.width + 10, max(0, bounds.width - labelX - pad))
+        nameLabel.frame = NSRect(x: labelX, y: pad, width: labelW, height: labelH)
+
+        // Reconnect button: bottom-right corner (AppKit origin is bottom-left).
+        let btn: CGFloat = 26
+        kickButton.frame = NSRect(x: bounds.width - btn - 6, y: 6, width: btn, height: btn)
     }
+
+    // MARK: - Hover → show/hide the reconnect button
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverArea { removeTrackingArea(hoverArea) }
+        let area = NSTrackingArea(rect: .zero,
+                                  options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        hoverArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) { kickButton.isHidden = false }
+    override func mouseExited(with event: NSEvent) { kickButton.isHidden = true }
+
+    @objc private func kickTapped() { onKick?() }
+
+    // MARK: - Updates
 
     func updateName(_ name: String) {
         nameLabel.stringValue = name
