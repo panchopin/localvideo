@@ -1,5 +1,25 @@
 # CPU Optimization Plan — LocalVideo
 
+> **Outcome (2026-06-25):** Measured, not guessed. Steady-state CPU is **~6%**
+> (release *and* debug; VideoToolbox decodes on dedicated hardware). The observed
+> **~150% was not the pipeline** — it was **ffmpeg demuxers accumulating across
+> sessions** (21 orphans found at session start, incl. a camera no longer in
+> config). Orphans survive only when an ffmpeg is stuck connecting/stalled and the
+> parent dies abnormally (it never writes → never hits EPIPE → never gets reaped).
+> Could not reproduce 150% via steady-state, debug build, reconnect churn, stalls,
+> or crash/kill. **Fix shipped: ffmpeg lifecycle hardening** (startup orphan sweep,
+> SIGINT/SIGTERM/SIGHUP teardown, SIGKILL fallback for stalled demuxers) —
+> latency-irrelevant, no pipeline changes. The parser/sample-buffer micro-opts
+> below were **deliberately skipped** (they'd shave fractions of a 6% baseline
+> while touching the latency-critical path — pure risk for no measurable gain).
+> Verified by a 5-test QA battery (orphan sweep, signal teardown, real-camera
+> non-regression, CPU unchanged at 5.8%, no accumulation under churn) — all PASS.
+> Harness: `tools/measure_cpu.sh`. Work landed on local branch `cpu-opt`.
+>
+> The analysis below is kept for reference / future scaling (e.g. 6+ cameras).
+
+
+
 _Goal: reduce sustained CPU (currently ~150%) without regressing the achieved glass-to-glass
 latency. Latency is still the product — every change here is evaluated first against
 "does this add latency?" and only kept if the answer is no (or negligible)._
