@@ -1,40 +1,35 @@
 import Foundation
 import CoreMedia
-import Darwin  // kill(2) / SIGKILL for the stalled-ffmpeg fallback
+import CRTSPDemux
 
-/// Pulls an RTSP stream's compressed H.264 via an `ffmpeg` subprocess used as a
-/// pure demuxer (`-c:v copy`, no decode), parses the elementary stream, and
-/// emits CMSampleBuffers. Decode + render happen natively downstream
-/// (AVSampleBufferDisplayLayer), so ffmpeg here only moves tiny compressed data.
+/// Pulls an RTSP(S) stream's compressed H.264 using an **in-process** libavformat
+/// demuxer (`CRTSPDemux`), parses the elementary stream, and emits CMSampleBuffers.
+/// Decode + render happen natively downstream (AVSampleBufferDisplayLayer).
+///
+/// This replaced an `ffmpeg` subprocess. The win: the camera URL (which can embed a
+/// password) now lives only in this process's memory and never appears in any process
+/// argv, so it can't leak via `ps`/pgrep/Activity Monitor. The demuxed bytes are the
+/// same Annex-B H.264 the old `ffmpeg -f h264 -` pipe produced, so the parser and the
+/// zero-copy render path are unchanged — and demux is not the latency-critical step.
 final class RTSPSource {
 
-    /// Called (on a background queue) for every decodable video frame.
+    /// Called (on the demux thread) for every decodable video frame.
     var onSampleBuffer: ((CMSampleBuffer) -> Void)?
-    /// Called (on a background queue) when the stream's status changes.
+    /// Called when the stream's status changes.
     var onStatus: ((StreamStatus) -> Void)?
 
     private let url: String
-    private let ffmpegPath: String
     private let parser = H264Parser()
-    private var process: Process?
-    private var stdoutPipe: Pipe?
+
+    // Demuxer handle + its background thread. All access to `demux` is on the main
+    // thread (start/stop/handleRunEnded) so the pointer is never used-after-free.
+    private var demux: OpaquePointer?
+    private var thread: Thread?
     private var stopping = false
     private var reportedStreaming = false
 
-    /// Credential-free signature shared by every ffmpeg this app spawns (see the
-    /// args in `start()`). Used to reap orphans from a prior crashed session.
-    static let ffmpegSignature = "dump_extra=freq=keyframe"
-
-    /// Resolve ffmpeg across common install locations (a bundled .app won't
-    /// inherit a shell PATH that includes Homebrew).
-    static let defaultFFmpegPath: String = {
-        let candidates = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
-        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) } ?? "/opt/homebrew/bin/ffmpeg"
-    }()
-
-    init(url: String, ffmpegPath: String = RTSPSource.defaultFFmpegPath) {
+    init(url: String) {
         self.url = url
-        self.ffmpegPath = ffmpegPath
         parser.onSampleBuffer = { [weak self] sb in
             guard let self else { return }
             if !self.reportedStreaming {
@@ -50,64 +45,55 @@ final class RTSPSource {
         reportedStreaming = false
         onStatus?(.connecting)
 
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: ffmpegPath)
-        proc.arguments = [
-            "-rtsp_transport", "tcp",
-            "-fflags", "nobuffer",
-            "-flags", "low_delay",
-            "-avioflags", "direct",
-            "-i", url,
-            "-an",                 // no audio
-            "-c:v", "copy",        // demux only — do NOT decode here
-            "-bsf:v", "dump_extra=freq=keyframe",  // ensure SPS/PPS before keyframes
-            "-f", "h264",          // raw Annex-B elementary stream
-            "-",                   // to stdout
-        ]
-
-        let stdoutPipe = Pipe()
-        self.stdoutPipe = stdoutPipe
-        proc.standardOutput = stdoutPipe
-        // Discard stderr: it can contain the URL (credentials) and we don't log it.
-        proc.standardError = FileHandle.nullDevice
-
-        stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            if data.isEmpty { return }
-            self?.parser.append(data)
-        }
-
-        proc.terminationHandler = { [weak self] _ in
-            guard let self, !self.stopping else { return }
-            self.onStatus?(.failed)
-        }
-
-        do {
-            try proc.run()
-            process = proc
-        } catch {
+        guard let d = url.withCString({ rtsp_demux_create($0) }) else {
             onStatus?(.failed)
+            return
+        }
+        demux = d
+
+        // Keep `self` alive for the lifetime of the thread; balanced in handleRunEnded.
+        let ctx = Unmanaged.passRetained(self).toOpaque()
+        let t = Thread {
+            // C callback: no captures allowed. Routes bytes to the owning source's parser.
+            let cb: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int32) -> Void = { userdata, bytes, len in
+                guard let userdata, let bytes, len > 0 else { return }
+                let src = Unmanaged<RTSPSource>.fromOpaque(userdata).takeUnretainedValue()
+                src.parser.append(Data(bytes: bytes, count: Int(len)))
+            }
+            _ = rtsp_demux_run(d, cb, ctx)
+            // Hand the demuxer pointer back to the main thread for teardown so the
+            // pointer lifecycle stays single-threaded.
+            DispatchQueue.main.async {
+                let src = Unmanaged<RTSPSource>.fromOpaque(ctx).takeRetainedValue()
+                src.handleRunEnded(d)
+            }
+        }
+        t.name = "rtsp-demux"
+        t.stackSize = 1 << 20
+        thread = t
+        t.start()
+    }
+
+    /// The run loop returned (error/EOF, or because stop() was requested). Runs on
+    /// the main thread; the only place a demuxer is freed.
+    private func handleRunEnded(_ d: OpaquePointer) {
+        if demux == d {
+            // Ended on its own (not via stop) — surface failure so the app reconnects.
+            demux = nil
+            rtsp_demux_free(d)
+            if !stopping { onStatus?(.failed) }
+        } else {
+            // stop() already detached this demuxer; free the retired one here.
+            rtsp_demux_free(d)
         }
     }
 
     func stop() {
         stopping = true
-
-        // Detach the reader so no further bytes reach the parser after stop.
-        stdoutPipe?.fileHandleForReading.readabilityHandler = nil
-        stdoutPipe = nil
-
-        guard let proc = process else { return }
-        process = nil
-        guard proc.isRunning else { return }
-
-        let pid = proc.processIdentifier
-        proc.terminate()  // SIGTERM: lets a healthy ffmpeg tear down its RTSP session.
-
-        // A stalled ffmpeg (blocked on a dead/stalled TCP socket, never writing)
-        // can ignore SIGTERM. Force-kill it shortly after so it can't orphan.
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1.5) {
-            if proc.isRunning { kill(pid, SIGKILL) }
+        if let d = demux {
+            rtsp_demux_stop(d)   // interrupts a blocked connect/read; thread frees it
+            demux = nil
         }
+        thread = nil
     }
 }

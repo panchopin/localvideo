@@ -1,6 +1,5 @@
 import AppKit
 import AVFoundation
-import Darwin  // POSIX signals for clean ffmpeg teardown on Ctrl-C / SIGTERM
 
 // ===========================================================================
 // LocalVideoNative — native low-latency multi-camera RTSP viewer.
@@ -53,7 +52,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     private var layoutMode: LayoutMode = .auto
     private var prefsController: PreferencesWindowController?
-    private var signalSources: [DispatchSourceSignal] = []
 
     private let configPathArg: String?
 
@@ -64,12 +62,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     // MARK: - Lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Reap any ffmpeg orphaned by a prior crashed/force-quit session before
-        // we spawn fresh ones — prevents cross-session accumulation (the cause of
-        // runaway CPU from piled-up demuxers).
-        reapOrphanedFFmpeg()
-        installSignalHandlers()
-
         configPath = Config.resolveConfigPath(explicit: configPathArg)
 
         window = NSWindow(
@@ -120,48 +112,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     func applicationWillTerminate(_ notification: Notification) {
         healthTimer?.invalidate()
+        // In-process demux threads are interrupted and wound down here; nothing
+        // outlives the app (no subprocess to orphan).
         sources.values.forEach { $0.stop() }
-        // The per-source SIGKILL fallback is async (1.5s) and won't fire before the
-        // process exits, so sweep synchronously to guarantee no ffmpeg outlives us.
-        reapOrphanedFFmpeg()
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
-    }
-
-    // MARK: - ffmpeg lifecycle hardening (no orphaned demuxers)
-
-    /// Force-kill any ffmpeg this app has spawned (matched by a credential-free
-    /// argument signature). Used at launch to clear orphans from a prior crashed
-    /// session, and on shutdown to catch any stalled straggler.
-    private func reapOrphanedFFmpeg() {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        p.arguments = ["-KILL", "-f", RTSPSource.ffmpegSignature]
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        try? p.run()
-        p.waitUntilExit()
-    }
-
-    /// Catch Ctrl-C (SIGINT, common in `swift run`), SIGTERM and SIGHUP so we tear
-    /// down ffmpeg children instead of dying and orphaning them. NSApplication does
-    /// not handle these by default; a DispatchSource runs our handler safely on the
-    /// main queue (signal handlers themselves must stay async-signal-safe).
-    private func installSignalHandlers() {
-        for sig in [SIGINT, SIGTERM, SIGHUP] {
-            signal(sig, SIG_IGN)  // suppress the default terminate; observe via the source
-            let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
-            src.setEventHandler { [weak self] in
-                self?.sources.values.forEach { $0.stop() }
-                self?.reapOrphanedFFmpeg()
-                exit(0)
-            }
-            src.resume()
-            signalSources.append(src)
-        }
     }
 
     // MARK: - Camera model (diffed apply)
