@@ -12,15 +12,20 @@ struct CameraConfig: Codable, Equatable {
     var url: String
     var username: String?
     var password: String?
+    /// Whether this camera streams in the main grid. When false the app does not
+    /// connect it or render a tile — it stays configured but hidden. Defaults to
+    /// true and is backward-compatible (absent in older cameras.json ⇒ shown).
+    var showVideoStream: Bool
 
-    enum CodingKeys: String, CodingKey { case id, name, url, username, password }
+    enum CodingKeys: String, CodingKey { case id, name, url, username, password, showVideoStream }
 
-    init(id: UUID = UUID(), name: String, url: String, username: String? = nil, password: String? = nil) {
+    init(id: UUID = UUID(), name: String, url: String, username: String? = nil, password: String? = nil, showVideoStream: Bool = true) {
         self.id = id
         self.name = name
         self.url = url
         self.username = username
         self.password = password
+        self.showVideoStream = showVideoStream
     }
 
     init(from decoder: Decoder) throws {
@@ -30,6 +35,8 @@ struct CameraConfig: Codable, Equatable {
         self.url = try c.decode(String.self, forKey: .url)
         self.username = try? c.decode(String.self, forKey: .username)
         self.password = try? c.decode(String.self, forKey: .password)
+        // Backward compatible: an older file without the key means "shown".
+        self.showVideoStream = (try? c.decode(Bool.self, forKey: .showVideoStream)) ?? true
     }
 
     func encode(to encoder: Encoder) throws {
@@ -39,6 +46,7 @@ struct CameraConfig: Codable, Equatable {
         try c.encode(url, forKey: .url)
         try c.encodeIfPresent(username, forKey: .username)
         try c.encodeIfPresent(password, forKey: .password)
+        try c.encode(showVideoStream, forKey: .showVideoStream)
     }
 
     /// Full RTSP(S) URL with credentials inserted if they were supplied

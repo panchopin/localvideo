@@ -131,29 +131,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     // MARK: - Camera model (diffed apply)
 
-    /// Apply a new camera list: stop removed cameras, start added ones, and
-    /// restart ONLY cameras whose connection details actually changed. Healthy
-    /// unchanged streams are never touched. Persists to cameras.json.
+    /// Cameras that should stream in the grid right now (the rest stay configured
+    /// but hidden). Source of the tile/stream/layout set.
+    private var shownCameras: [CameraConfig] { cameras.filter { $0.showVideoStream } }
+
+    /// Apply a new camera list: only cameras with `showVideoStream` get a tile +
+    /// stream; the grid adapts to that subset. Streams are stopped for cameras that
+    /// were deleted OR toggled hidden, started for ones added OR toggled shown, and
+    /// restarted ONLY when connection details changed. Persists the FULL list.
     func applyCameras(_ newCameras: [CameraConfig]) {
         let capped = Array(newCameras.prefix(maxCameras))
         let oldById = Dictionary(uniqueKeysWithValues: cameras.map { ($0.id, $0) })
-        let newIds = Set(capped.map { $0.id })
+        // The set of cameras that should have a live tile + stream right now.
+        let shouldShow = Set(capped.filter { $0.showVideoStream }.map { $0.id })
 
-        // Remove deleted cameras.
-        for old in cameras where !newIds.contains(old.id) {
-            sources[old.id]?.stop()
-            sources[old.id] = nil
-            tilesById[old.id]?.removeFromSuperview()
-            tilesById[old.id] = nil
-            statuses[old.id] = nil
+        // Remove any camera that currently has a tile but should no longer be shown.
+        // Keying off tilesById (not the id list) covers BOTH deletion and toggle-off.
+        for (id, tile) in tilesById where !shouldShow.contains(id) {
+            sources[id]?.stop()
+            sources[id] = nil
+            tile.removeFromSuperview()
+            tilesById[id] = nil
+            statuses[id] = nil
+            lastFrameAt[id] = nil
+            sourceStartedAt[id] = nil
+            lastKickAt[id] = nil
         }
 
-        // If the enlarged camera was deleted, drop back to the grid.
-        if let s = soloedId, !newIds.contains(s) { exitSolo() }
+        // If the enlarged camera is no longer shown (deleted or hidden), exit solo.
+        if let s = soloedId, !shouldShow.contains(s) { exitSolo() }
 
-        // Add / update, building the tile order to match the new list.
+        // Add / update the shown cameras, building the tile order to match the list.
         var orderedTiles: [CameraTileView] = []
-        for cam in capped {
+        for cam in capped where cam.showVideoStream {
             if let old = oldById[cam.id], let tile = tilesById[cam.id] {
                 if old.name != cam.name { tile.updateName(cam.name) }
                 if old.resolvedURL != cam.resolvedURL {
@@ -162,6 +172,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                 }
                 orderedTiles.append(tile)
             } else {
+                // Newly added OR toggled back on (no tile yet) → start fresh.
                 let tile = CameraTileView(id: cam.id, name: cam.name)
                 tile.onKick = { [weak self] in self?.reconnect(id: cam.id) }
                 tilesById[cam.id] = tile
@@ -176,6 +187,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         updateEmptyState()
         persist()
         prefsController?.reloadFromModel()
+
+        // Test seam: let a smoke test assert how many cameras are shown.
+        if ProcessInfo.processInfo.environment["LOCALVIDEO_SMOKE"] == "1" {
+            FileHandle.standardError.write("SHOWN_CAMERAS=\(shownCameras.count)\n".data(using: .utf8)!)
+        }
     }
 
     // MARK: - Reorder (drag-to-swap) & solo (double-click enlarge)
@@ -184,10 +200,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     /// stopped or restarted — tiles keep their live `RTSPSource`. Persisted so the
     /// order survives relaunch.
     private func reorderCameras(from: Int, to: Int) {
-        guard cameras.indices.contains(from), cameras.indices.contains(to), from != to else { return }
-        cameras.swapAt(from, to)
-        let ordered = cameras.compactMap { tilesById[$0.id] }
-        grid.setTiles(ordered)   // reorders tiles; does not touch any source
+        // from/to are indices into the SHOWN tiles (grid.tiles). Map them to the
+        // full `cameras` array by identity so interspersed hidden cameras keep
+        // their slots, then swap.
+        let tiles = grid.tiles
+        guard tiles.indices.contains(from), tiles.indices.contains(to), from != to else { return }
+        let fromId = tiles[from].cameraId, toId = tiles[to].cameraId
+        guard let fi = cameras.firstIndex(where: { $0.id == fromId }),
+              let ti = cameras.firstIndex(where: { $0.id == toId }) else { return }
+        cameras.swapAt(fi, ti)
+        grid.setTiles(shownCameras.compactMap { tilesById[$0.id] })   // reorder; no source touched
         updateLayout()
         persist()
         prefsController?.reloadFromModel()
@@ -251,7 +273,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     /// Force a fresh connection for one camera (manual kick button, or auto on stall).
     func reconnect(id: UUID) {
-        guard let cam = cameras.first(where: { $0.id == id }) else { return }
+        // Never resurrect a hidden camera (guards against a demux-thread callback
+        // arriving right after stop() during a toggle-off).
+        guard let cam = cameras.first(where: { $0.id == id }), cam.showVideoStream else { return }
         sources[id]?.stop()
         tilesById[id]?.video.flushDisplay()
         lastKickAt[id] = Date()
@@ -278,8 +302,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     /// auto-kick a stalled stream (with a cooldown so we don't thrash).
     private func checkHealth() {
         let now = Date()
-        for cam in cameras {
-            let id = cam.id
+        // Only cameras with a live source (shown). Hidden cameras have none, so
+        // they are never health-checked or auto-reconnected. Snapshot the keys to
+        // avoid mutating `sources` mid-iteration (reconnect replaces entries).
+        for id in Array(sources.keys) {
             let status: StreamStatus
             if let last = lastFrameAt[id] {
                 let age = now.timeIntervalSince(last)
@@ -309,16 +335,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     private func updateEmptyState() {
-        let empty = cameras.isEmpty
-        grid.isHidden = empty
-        emptyLabel.isHidden = !empty
+        // Empty when nothing is shown — either no cameras at all, or all hidden.
+        let noneShown = shownCameras.isEmpty
+        grid.isHidden = noneShown
+        emptyLabel.isHidden = !noneShown
+        if cameras.isEmpty {
+            emptyLabel.stringValue = "No cameras configured.\nPress ⌘, to add one."
+        } else if noneShown {
+            emptyLabel.stringValue = "All cameras are hidden.\nEnable one in Preferences (⌘,)."
+        }
     }
 
     // MARK: - Layout
 
     private func updateLayout() {
         switch layoutMode {
-        case .auto: grid.columns = autoColumns(cameras.count)
+        case .auto: grid.columns = autoColumns(shownCameras.count)
         case .manual(let n): grid.columns = n
         }
     }

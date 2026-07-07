@@ -16,6 +16,7 @@ final class PreferencesWindowController: NSWindowController, NSTableViewDataSour
     private let urlField = NSTextField()
     private let userField = NSTextField()
     private let passField = NSSecureTextField()
+    private let showStreamCheckbox = NSButton()
     private let errorLabel = NSTextField(labelWithString: "")
     private let saveButton = NSButton()
     private let addButton = NSButton()
@@ -100,7 +101,14 @@ final class PreferencesWindowController: NSWindowController, NSTableViewDataSour
         addLabel("Password", x: 272, y: 196, to: content)
         configureField(passField, placeholder: "Optional", x: 272, y: 172, to: content)
 
-        errorLabel.frame = NSRect(x: 272, y: 116, width: 332, height: 48)
+        // "Show video stream" checkbox: when off, the camera stays configured but
+        // is not streamed/shown in the grid. Applied on Save (no live action).
+        showStreamCheckbox.setButtonType(.switch)
+        showStreamCheckbox.title = "Show video stream"
+        showStreamCheckbox.frame = NSRect(x: 272, y: 146, width: 332, height: 18)
+        content.addSubview(showStreamCheckbox)
+
+        errorLabel.frame = NSRect(x: 272, y: 104, width: 332, height: 40)
         errorLabel.textColor = .systemRed
         errorLabel.font = .systemFont(ofSize: 11)
         errorLabel.maximumNumberOfLines = 3
@@ -160,6 +168,7 @@ final class PreferencesWindowController: NSWindowController, NSTableViewDataSour
             urlField.stringValue = ""
             userField.stringValue = ""
             passField.stringValue = ""
+            showStreamCheckbox.state = .on
             setFormEnabled(false)
             errorLabel.stringValue = ""
             return
@@ -169,11 +178,13 @@ final class PreferencesWindowController: NSWindowController, NSTableViewDataSour
         urlField.stringValue = cam.url
         userField.stringValue = cam.username ?? ""
         passField.stringValue = cam.password ?? ""
+        showStreamCheckbox.state = cam.showVideoStream ? .on : .off
         errorLabel.stringValue = ""
     }
 
     private func setFormEnabled(_ enabled: Bool) {
         [nameField, urlField, userField, passField].forEach { $0.isEnabled = enabled }
+        showStreamCheckbox.isEnabled = enabled
         saveButton.isEnabled = enabled
     }
 
@@ -222,7 +233,8 @@ final class PreferencesWindowController: NSWindowController, NSTableViewDataSour
         list[idx] = CameraConfig(
             id: id, name: name, url: url,
             username: user.isEmpty ? nil : user,
-            password: pass.isEmpty ? nil : pass
+            password: pass.isEmpty ? nil : pass,
+            showVideoStream: showStreamCheckbox.state == .on
         )
         showError("")
         app?.applyCameras(list)
@@ -339,6 +351,8 @@ final class PreferencesWindowController: NSWindowController, NSTableViewDataSour
         label.lineBreakMode = .byTruncatingTail
         label.frame = NSRect(x: 18, y: 3, width: (tableColumn?.width ?? 200) - 22, height: 18)
         label.autoresizingMask = [.width]
+        // Dim cameras that are hidden from the grid so the list shows their state.
+        label.textColor = cam.showVideoStream ? .labelColor : .secondaryLabelColor
         cell.addSubview(label)
         cell.textField = label
 
