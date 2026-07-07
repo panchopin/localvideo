@@ -53,6 +53,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var layoutMode: LayoutMode = .auto
     private var prefsController: PreferencesWindowController?
 
+    // Solo (double-click enlarge): which camera is enlarged, and the layout to
+    // restore when solo exits. Transient view state — never persisted.
+    private var soloedId: UUID?
+    private var preSoloLayout: LayoutMode?
+
     private let configPathArg: String?
 
     init(configPathArg: String?) {
@@ -79,6 +84,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         grid = GridContainerView()
         grid.frame = content.bounds
         grid.autoresizingMask = [.width, .height]
+        grid.onReorder = { [weak self] from, to in self?.reorderCameras(from: from, to: to) }
+        grid.onToggleSolo = { [weak self] tile in self?.toggleSolo(tile) }
         content.addSubview(grid)
 
         emptyLabel = NSTextField(labelWithString: "No cameras configured.\nPress ⌘, to add one.")
@@ -141,6 +148,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             statuses[old.id] = nil
         }
 
+        // If the enlarged camera was deleted, drop back to the grid.
+        if let s = soloedId, !newIds.contains(s) { exitSolo() }
+
         // Add / update, building the tile order to match the new list.
         var orderedTiles: [CameraTileView] = []
         for cam in capped {
@@ -152,7 +162,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                 }
                 orderedTiles.append(tile)
             } else {
-                let tile = CameraTileView(name: cam.name)
+                let tile = CameraTileView(id: cam.id, name: cam.name)
                 tile.onKick = { [weak self] in self?.reconnect(id: cam.id) }
                 tilesById[cam.id] = tile
                 startCamera(cam)
@@ -166,6 +176,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         updateEmptyState()
         persist()
         prefsController?.reloadFromModel()
+    }
+
+    // MARK: - Reorder (drag-to-swap) & solo (double-click enlarge)
+
+    /// Swap two cameras' positions (from a tile drag). Pure reorder: no stream is
+    /// stopped or restarted — tiles keep their live `RTSPSource`. Persisted so the
+    /// order survives relaunch.
+    private func reorderCameras(from: Int, to: Int) {
+        guard cameras.indices.contains(from), cameras.indices.contains(to), from != to else { return }
+        cameras.swapAt(from, to)
+        let ordered = cameras.compactMap { tilesById[$0.id] }
+        grid.setTiles(ordered)   // reorders tiles; does not touch any source
+        updateLayout()
+        persist()
+        prefsController?.reloadFromModel()
+    }
+
+    /// Toggle enlarge for a tile: enter solo (remembering the current layout) or,
+    /// if already solo, exit back to that layout.
+    private func toggleSolo(_ tile: CameraTileView) {
+        if soloedId != nil {
+            exitSolo()
+        } else {
+            preSoloLayout = layoutMode
+            soloedId = tile.cameraId
+            grid.setSolo(tile)
+        }
+    }
+
+    private func exitSolo() {
+        guard soloedId != nil else { return }
+        soloedId = nil
+        grid.setSolo(nil)
+        if let restore = preSoloLayout {
+            layoutMode = restore
+            updateLayout()
+        }
+        preSoloLayout = nil
     }
 
     private func makeSource(_ camera: CameraConfig) -> RTSPSource {
@@ -276,6 +324,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     private func setLayoutMode(_ mode: LayoutMode) {
+        // An explicit layout command (0 / 1–6) exits solo and applies the
+        // requested layout (rather than restoring the pre-solo one).
+        if soloedId != nil {
+            soloedId = nil
+            preSoloLayout = nil
+            grid.setSolo(nil)
+        }
         layoutMode = mode
         updateLayout()
     }
@@ -372,6 +427,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                 return event  // let ⌘/⌃ combos go to the menu
             }
             if event.keyCode == 53 {  // Escape
+                if self.grid.isDragging {   // cancel an in-progress drag instead of quitting
+                    self.grid.cancelActiveDrag()
+                    return nil
+                }
                 NSApp.terminate(nil)
                 return nil
             }
