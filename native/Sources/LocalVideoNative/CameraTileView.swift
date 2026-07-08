@@ -18,6 +18,8 @@ final class CameraTileView: NSView {
     let cameraId: UUID
     let video = VideoLayerView(frame: .zero)
     private let nameLabel = NSTextField(labelWithString: "")
+    /// The camera name without any zoom suffix (the label may show "Name  2.4×").
+    private var baseName: String = ""
     private let statusDot = NSView()
     private let kickButton = NSButton()
     private var status: StreamStatus = .connecting
@@ -34,11 +36,17 @@ final class CameraTileView: NSView {
     private var dragging = false
     private let dragThreshold: CGFloat = 6
 
+    // Zoom-in-place gesture state.
+    /// Last drag location (window coords) while panning a zoomed tile.
+    private var lastPanPoint: NSPoint?
+    /// Scroll-wheel points → zoom factor sensitivity.
+    private let scrollZoomK: CGFloat = 0.01
+
     /// Invoked when the user clicks the reconnect button.
     var onKick: (() -> Void)?
 
-    /// The displayed camera name (used to build the drag ghost).
-    var cameraName: String { nameLabel.stringValue }
+    /// The displayed camera name (used to build the drag ghost). Excludes the zoom suffix.
+    var cameraName: String { baseName }
 
     init(id: UUID, name: String) {
         self.cameraId = id
@@ -49,6 +57,7 @@ final class CameraTileView: NSView {
         layer = root
 
         video.autoresizingMask = [.width, .height]
+        video.onZoomChanged = { [weak self] in self?.updateZoomIndicator() }
         addSubview(video)
 
         statusDot.wantsLayer = true
@@ -58,6 +67,7 @@ final class CameraTileView: NSView {
         statusDot.layer = dotLayer
         addSubview(statusDot)
 
+        baseName = name
         nameLabel.stringValue = name
         nameLabel.textColor = .white
         nameLabel.font = .systemFont(ofSize: 11)
@@ -117,17 +127,33 @@ final class CameraTileView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         if event.clickCount == 2 {
-            // Double-click → enlarge/restore. Cancel any armed drag.
+            // Double-click backs out the current close-up: reset zoom if zoomed,
+            // otherwise toggle solo/enlarge. Cancel any armed drag/pan.
             mouseDownPoint = nil
+            lastPanPoint = nil
             dragging = false
-            interactionDelegate?.tileRequestedSoloToggle(self)
+            if video.isZoomed {
+                video.resetZoom()
+            } else {
+                interactionDelegate?.tileRequestedSoloToggle(self)
+            }
             return
         }
         mouseDownPoint = event.locationInWindow
+        lastPanPoint = event.locationInWindow
         dragging = false
     }
 
     override func mouseDragged(with event: NSEvent) {
+        // When zoomed, a drag pans the picture (grab-and-move) instead of arming a
+        // drag-to-swap. Window coords share the view's bottom-left y, so deltas map 1:1.
+        if video.isZoomed {
+            guard let last = lastPanPoint else { lastPanPoint = event.locationInWindow; return }
+            let p = event.locationInWindow
+            video.panBy(dxInView: p.x - last.x, dyInView: p.y - last.y)
+            lastPanPoint = p
+            return
+        }
         guard let start = mouseDownPoint else { return }
         let p = event.locationInWindow
         if !dragging {
@@ -146,7 +172,37 @@ final class CameraTileView: NSView {
             interactionDelegate?.tileEndedDrag(at: event.locationInWindow)
         }
         mouseDownPoint = nil
+        lastPanPoint = nil
         dragging = false
+    }
+
+    // MARK: - Zoom in place (pinch / scroll)
+
+    /// Trackpad pinch → zoom about the gesture point.
+    override func magnify(with event: NSEvent) {
+        let p = video.convert(event.locationInWindow, from: nil)
+        video.applyZoom(scaleDelta: 1 + event.magnification, aroundPointInView: p)
+    }
+
+    /// Scroll wheel. Horizontal scroll or ⇧+scroll → zoom about the pointer; a plain
+    /// scroll pans the picture when zoomed (otherwise passed through).
+    override func scrollWheel(with event: NSEvent) {
+        let dx = event.scrollingDeltaX, dy = event.scrollingDeltaY
+        let zoomGesture = event.modifierFlags.contains(.shift) || abs(dx) > abs(dy)
+        if zoomGesture {
+            // Dominant-axis delta drives the zoom; clamp per event so a fast flick
+            // can't slam across the whole range at once.
+            let d = abs(dx) > abs(dy) ? dx : dy
+            let factor = 1 + max(-0.3, min(0.3, d * scrollZoomK))
+            let p = video.convert(event.locationInWindow, from: nil)
+            video.applyZoom(scaleDelta: factor, aroundPointInView: p)
+        } else if video.isZoomed {
+            // Two-finger / wheel pan: the crop window follows the scroll direction,
+            // i.e. the content moves opposite the scroll.
+            video.panBy(dxInView: -dx, dyInView: dy)
+        } else {
+            super.scrollWheel(with: event)
+        }
     }
 
     // MARK: - Hover → show/hide the reconnect button
@@ -182,7 +238,16 @@ final class CameraTileView: NSView {
     // MARK: - Updates
 
     func updateName(_ name: String) {
-        nameLabel.stringValue = name
+        baseName = name
+        updateZoomIndicator()
+    }
+
+    /// Reflect the current zoom factor as a suffix on the name label ("Front Door  2.4×");
+    /// shows just the name at exactly 1×.
+    private func updateZoomIndicator() {
+        nameLabel.stringValue = video.isZoomed
+            ? String(format: "%@  %.1f×", baseName, video.zoomScale)
+            : baseName
         needsLayout = true
     }
 
