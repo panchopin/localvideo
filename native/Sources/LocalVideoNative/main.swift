@@ -625,11 +625,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             switch result {
             case .success(let zipURL):
                 panel.setInstalling()
-                do {
-                    try Updater.installAndRelaunch(zipAt: zipURL)   // quits the app on success
-                } catch {
-                    panel.close()
-                    self?.openReleasePage(release, reason: error.localizedDescription)
+                Updater.installAndRelaunch(zipAt: zipURL) { error in
+                    panel.close()   // dismiss BEFORE terminating, else terminate is cancelled
+                    if let error {
+                        self?.openReleasePage(release, reason: error.localizedDescription)
+                    } else {
+                        // Swap script is armed and waiting for us to exit.
+                        NSApp.terminate(nil)
+                    }
                 }
             case .failure(let error):
                 panel.close()
@@ -703,19 +706,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 }
 
-/// A minimal sheet shown over the main window during an update download/install:
-/// a title line and a determinate progress bar (indeterminate while installing).
+/// A small progress window shown over the main window during an update
+/// download/install: a title line and a progress bar (indeterminate while
+/// installing). Deliberately a CHILD WINDOW, not a sheet — a sheet blocks
+/// NSApp.terminate (it can't close a window that has an attached sheet), which
+/// would hang the swap-and-relaunch step.
 final class UpdateProgressPanel {
-    private let parent: NSWindow
-    private let sheet: NSWindow
+    private weak var parent: NSWindow?
+    private let panel: NSWindow
     private let bar = NSProgressIndicator()
     private let label = NSTextField(labelWithString: "")
 
     init(over parent: NSWindow, version: String) {
         self.parent = parent
-        sheet = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 380, height: 96),
+        panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 380, height: 96),
                          styleMask: [.titled], backing: .buffered, defer: false)
-        let content = sheet.contentView!
+        panel.title = "Software Update"
+        let content = panel.contentView!
 
         label.stringValue = "Downloading LocalVideo \(version)…"
         label.font = .systemFont(ofSize: 13, weight: .medium)
@@ -730,14 +737,26 @@ final class UpdateProgressPanel {
         content.addSubview(bar)
     }
 
-    func show() { parent.beginSheet(sheet, completionHandler: nil) }
+    func show() {
+        // Center over the parent and pin as a child window so it floats above but
+        // never becomes a sheet.
+        if let parent {
+            let pf = parent.frame, s = panel.frame.size
+            panel.setFrameOrigin(NSPoint(x: pf.midX - s.width / 2, y: pf.midY - s.height / 2))
+            parent.addChildWindow(panel, ordered: .above)
+        }
+        panel.makeKeyAndOrderFront(nil)
+    }
     func setProgress(_ p: Double) { bar.isIndeterminate = false; bar.doubleValue = p }
     func setInstalling() {
         label.stringValue = "Installing update…"
         bar.isIndeterminate = true
         bar.startAnimation(nil)
     }
-    func close() { parent.endSheet(sheet) }
+    func close() {
+        parent?.removeChildWindow(panel)
+        panel.orderOut(nil)
+    }
 }
 
 /// Hidden self-test: run the record path (H264Parser → CameraRecorder) over an

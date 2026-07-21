@@ -105,13 +105,23 @@ enum Updater {
 
     // MARK: - Download + install
 
+    /// Strong reference that keeps the download's URLSession (and its delegate)
+    /// alive for the whole transfer. Without this the session is deallocated when
+    /// `download` returns, the transfer stalls, and no callback ever fires — the
+    /// progress UI would hang forever. Cleared when the download finishes.
+    private static var downloadSession: URLSession?
+
     /// Download the release zip to a temp file. Progress (0...1) and completion run
     /// on the main thread.
     static func download(_ release: Release,
                          progress: @escaping (Double) -> Void,
                          completion: @escaping (Result<URL, Error>) -> Void) {
-        let delegate = DownloadDelegate(progress: progress, completion: completion)
+        let delegate = DownloadDelegate(progress: progress, completion: { result in
+            downloadSession = nil            // release once the transfer is done
+            completion(result)
+        })
         let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+        downloadSession = session            // retain for the transfer's lifetime
         var req = URLRequest(url: release.zipURL)
         req.setValue("LocalVideo/\(currentVersion)", forHTTPHeaderField: "User-Agent")
         session.downloadTask(with: req).resume()
@@ -120,67 +130,81 @@ enum Updater {
     /// Unpack the zip, verify it holds LocalVideo.app, then hand off to a detached
     /// shell script that waits for THIS process to quit, swaps the bundle in place,
     /// and relaunches. On success this terminates the app and does not return.
-    static func installAndRelaunch(zipAt zipURL: URL) throws {
+    /// Unpack + swap on a background queue (ditto can take seconds — never block the
+    /// main thread, or the progress UI freezes and looks hung). `completion` runs on
+    /// the main thread: `nil` means the swap script is armed and the app is about to
+    /// quit/relaunch; an error means installation failed (nothing was changed enough
+    /// to matter — the caller offers the manual download).
+    static func installAndRelaunch(zipAt zipURL: URL, completion: @escaping (Error?) -> Void) {
         let bundlePath = Bundle.main.bundlePath
-        guard bundlePath.hasSuffix(".app") else { throw UpdaterError.notABundle }
+        let fm = FileManager.default
+        func fail(_ e: Error) { DispatchQueue.main.async { completion(e) } }
 
+        guard bundlePath.hasSuffix(".app") else { return fail(UpdaterError.notABundle) }
         // Bail early (before quitting) if we can't replace the bundle in place.
         let parentDir = (bundlePath as NSString).deletingLastPathComponent
-        let fm = FileManager.default
-        guard fm.isWritableFile(atPath: parentDir) else { throw UpdaterError.notWritable(parentDir) }
+        guard fm.isWritableFile(atPath: parentDir) else { return fail(UpdaterError.notWritable(parentDir)) }
 
-        let work = fm.temporaryDirectory.appendingPathComponent("LocalVideoUpdate-\(UUID().uuidString)")
-        try fm.createDirectory(at: work, withIntermediateDirectories: true)
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let work = fm.temporaryDirectory.appendingPathComponent("LocalVideoUpdate-\(UUID().uuidString)")
+                try fm.createDirectory(at: work, withIntermediateDirectories: true)
 
-        // Unzip with ditto (handles the ditto-created archive from the release job).
-        let unzip = Process()
-        unzip.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-        unzip.arguments = ["-x", "-k", zipURL.path, work.path]
-        let errPipe = Pipe()
-        unzip.standardError = errPipe
-        try unzip.run()
-        unzip.waitUntilExit()
-        guard unzip.terminationStatus == 0 else {
-            let msg = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "ditto failed"
-            throw UpdaterError.unzipFailed(msg)
+                // Unzip with ditto (handles the ditto-created archive from the release job).
+                let unzip = Process()
+                unzip.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+                unzip.arguments = ["-x", "-k", zipURL.path, work.path]
+                let errPipe = Pipe()
+                unzip.standardError = errPipe
+                try unzip.run()
+                unzip.waitUntilExit()
+                guard unzip.terminationStatus == 0 else {
+                    let msg = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "ditto failed"
+                    throw UpdaterError.unzipFailed(msg)
+                }
+
+                // Find the unpacked LocalVideo.app (top level, or one dir down).
+                guard let newApp = findApp(in: work, fm: fm) else { throw UpdaterError.bundleMissing }
+
+                // Detached swap-and-relaunch script. Lives in its OWN temp file (NOT inside
+                // `work`, which it deletes). Moves the old bundle aside first and rolls back
+                // if the copy fails, so a failed update never leaves the user with no app.
+                let pid = ProcessInfo.processInfo.processIdentifier
+                let dest = shq(bundlePath)
+                let src = shq(newApp.path)
+                let backup = shq(bundlePath + ".old")
+                let script = """
+                #!/bin/sh
+                # Wait for LocalVideo (pid \(pid)) to quit, then swap the bundle and relaunch.
+                while kill -0 \(pid) 2>/dev/null; do sleep 0.2; done
+                /bin/rm -rf \(backup)
+                /bin/mv \(dest) \(backup) || exit 1
+                if /usr/bin/ditto \(src) \(dest) && [ -x \(dest)/Contents/MacOS/LocalVideo ]; then
+                    /bin/rm -rf \(backup)
+                else
+                    /bin/rm -rf \(dest)
+                    /bin/mv \(backup) \(dest)   # roll back to the working app
+                fi
+                /usr/bin/xattr -dr com.apple.quarantine \(dest) 2>/dev/null
+                /bin/rm -rf \(shq(work.path)) \(shq(zipURL.path))
+                /usr/bin/open \(dest)
+                """
+                let scriptURL = fm.temporaryDirectory.appendingPathComponent("LocalVideoSwap-\(UUID().uuidString).sh")
+                try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+
+                let swap = Process()
+                swap.executableURL = URL(fileURLWithPath: "/bin/sh")
+                swap.arguments = [scriptURL.path]
+                try swap.run()   // detached: we don't wait
+
+                // Arm succeeded — let the caller dismiss UI, then quit so the script
+                // can replace us. (Terminating here while a sheet/panel is up can be
+                // silently cancelled, hanging the swap.)
+                DispatchQueue.main.async { completion(nil) }
+            } catch {
+                fail(error)
+            }
         }
-
-        // Find the unpacked LocalVideo.app (top level, or one dir down).
-        guard let newApp = findApp(in: work, fm: fm) else { throw UpdaterError.bundleMissing }
-
-        // Detached swap-and-relaunch script. Lives in its OWN temp file (NOT inside
-        // `work`, which it deletes). Moves the old bundle aside first and rolls back
-        // if the copy fails, so a failed update never leaves the user with no app.
-        let pid = ProcessInfo.processInfo.processIdentifier
-        let dest = shq(bundlePath)
-        let src = shq(newApp.path)
-        let backup = shq(bundlePath + ".old")
-        let script = """
-        #!/bin/sh
-        # Wait for LocalVideo (pid \(pid)) to quit, then swap the bundle and relaunch.
-        while kill -0 \(pid) 2>/dev/null; do sleep 0.2; done
-        /bin/rm -rf \(backup)
-        /bin/mv \(dest) \(backup) || exit 1
-        if /usr/bin/ditto \(src) \(dest) && [ -x \(dest)/Contents/MacOS/LocalVideo ]; then
-            /bin/rm -rf \(backup)
-        else
-            /bin/rm -rf \(dest)
-            /bin/mv \(backup) \(dest)   # roll back to the working app
-        fi
-        /usr/bin/xattr -dr com.apple.quarantine \(dest) 2>/dev/null
-        /bin/rm -rf \(shq(work.path)) \(shq(zipURL.path))
-        /usr/bin/open \(dest)
-        """
-        let scriptURL = fm.temporaryDirectory.appendingPathComponent("LocalVideoSwap-\(UUID().uuidString).sh")
-        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
-
-        let swap = Process()
-        swap.executableURL = URL(fileURLWithPath: "/bin/sh")
-        swap.arguments = [scriptURL.path]
-        try swap.run()   // detached: we don't wait
-
-        // Quit so the script can replace us.
-        DispatchQueue.main.async { NSApp.terminate(nil) }
     }
 
     /// Locate LocalVideo.app inside `dir` (top level or immediate subdirectories).
