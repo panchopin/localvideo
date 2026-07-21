@@ -16,16 +16,21 @@ struct CameraConfig: Codable, Equatable {
     /// connect it or render a tile — it stays configured but hidden. Defaults to
     /// true and is backward-compatible (absent in older cameras.json ⇒ shown).
     var showVideoStream: Bool
+    /// Whether this camera is continuously recorded to disk. A camera streams (has
+    /// a live RTSPSource) when `showVideoStream || recordVideo`, so recording works
+    /// even for a camera hidden from the grid. Defaults to false; backward-compatible.
+    var recordVideo: Bool
 
-    enum CodingKeys: String, CodingKey { case id, name, url, username, password, showVideoStream }
+    enum CodingKeys: String, CodingKey { case id, name, url, username, password, showVideoStream, recordVideo }
 
-    init(id: UUID = UUID(), name: String, url: String, username: String? = nil, password: String? = nil, showVideoStream: Bool = true) {
+    init(id: UUID = UUID(), name: String, url: String, username: String? = nil, password: String? = nil, showVideoStream: Bool = true, recordVideo: Bool = false) {
         self.id = id
         self.name = name
         self.url = url
         self.username = username
         self.password = password
         self.showVideoStream = showVideoStream
+        self.recordVideo = recordVideo
     }
 
     init(from decoder: Decoder) throws {
@@ -37,6 +42,7 @@ struct CameraConfig: Codable, Equatable {
         self.password = try? c.decode(String.self, forKey: .password)
         // Backward compatible: an older file without the key means "shown".
         self.showVideoStream = (try? c.decode(Bool.self, forKey: .showVideoStream)) ?? true
+        self.recordVideo = (try? c.decode(Bool.self, forKey: .recordVideo)) ?? false
     }
 
     func encode(to encoder: Encoder) throws {
@@ -47,6 +53,7 @@ struct CameraConfig: Codable, Equatable {
         try c.encodeIfPresent(username, forKey: .username)
         try c.encodeIfPresent(password, forKey: .password)
         try c.encode(showVideoStream, forKey: .showVideoStream)
+        try c.encode(recordVideo, forKey: .recordVideo)
     }
 
     /// Full RTSP(S) URL with credentials inserted if they were supplied
@@ -65,8 +72,41 @@ struct CameraConfig: Codable, Equatable {
     }
 }
 
+/// Global recording settings (the `recording` block in cameras.json). All fields
+/// are optional on read so an older file (or a partial block) falls back to
+/// defaults. See docs/RECORDING_SPEC.md §7.
+struct RecordingSettings: Equatable {
+    var directory: String
+    var retentionHours: Int
+    var segmentSeconds: Int
+
+    /// ~/Movies/LocalVideo, keep 48h, 60s segments.
+    static var `default`: RecordingSettings {
+        let movies = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory() + "/Movies")
+        return RecordingSettings(
+            directory: movies.appendingPathComponent("LocalVideo", isDirectory: true).path,
+            retentionHours: 48,
+            segmentSeconds: 60
+        )
+    }
+}
+
+extension RecordingSettings: Codable {
+    enum CodingKeys: String, CodingKey { case directory, retentionHours, segmentSeconds }
+
+    init(from decoder: Decoder) throws {
+        let d = RecordingSettings.default
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.directory = (try? c.decode(String.self, forKey: .directory)).flatMap { $0.isEmpty ? nil : $0 } ?? d.directory
+        self.retentionHours = (try? c.decode(Int.self, forKey: .retentionHours)).flatMap { $0 > 0 ? $0 : nil } ?? d.retentionHours
+        self.segmentSeconds = (try? c.decode(Int.self, forKey: .segmentSeconds)).flatMap { $0 > 0 ? $0 : nil } ?? d.segmentSeconds
+    }
+}
+
 private struct CamerasFile: Codable {
     let cameras: [CameraConfig]
+    let recording: RecordingSettings?
 }
 
 enum Config {
@@ -99,12 +139,22 @@ enum Config {
         return parsed.cameras
     }
 
-    /// Persist the camera list atomically (write-temp-then-rename). Always
-    /// writes `url` / `username` / `password` separately — never `resolvedURL`.
-    static func save(_ cameras: [CameraConfig], to path: String) throws {
+    /// Load the global recording settings (defaults if missing/invalid).
+    static func loadRecording(from path: String) -> RecordingSettings {
+        guard let data = FileManager.default.contents(atPath: path),
+              let parsed = try? JSONDecoder().decode(CamerasFile.self, from: data) else {
+            return .default
+        }
+        return parsed.recording ?? .default
+    }
+
+    /// Persist the camera list + recording settings atomically (write-temp-then-
+    /// rename). Always writes `url` / `username` / `password` separately — never
+    /// `resolvedURL`.
+    static func save(_ cameras: [CameraConfig], recording: RecordingSettings, to path: String) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(CamerasFile(cameras: cameras))
+        let data = try encoder.encode(CamerasFile(cameras: cameras, recording: recording))
         try data.write(to: URL(fileURLWithPath: path), options: .atomic)
     }
 }

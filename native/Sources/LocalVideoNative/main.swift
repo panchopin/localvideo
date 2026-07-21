@@ -39,6 +39,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var tilesById: [UUID: CameraTileView] = [:]
     private var sources: [UUID: RTSPSource] = [:]
 
+    // Recording. A camera streams (has a source) when showVideoStream || recordVideo;
+    // a recorder is attached only while recordVideo is on. See docs/RECORDING_SPEC.md.
+    private(set) var recordingSettings: RecordingSettings = .default
+    private var recordingStore = RecordingStore(settings: .default)
+    private var recorders: [UUID: CameraRecorder] = [:]
+    private var retentionTimer: Timer?
+
     // Stream-health tracking (all touched on the main thread).
     private var lastFrameAt: [UUID: Date] = [:]
     private var sourceStartedAt: [UUID: Date] = [:]
@@ -108,6 +115,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         setupMenu()
         installKeyHandler()
 
+        // Load global recording settings before building cameras (recorders attach
+        // during applyCameras).
+        recordingSettings = Config.loadRecording(from: configPath)
+        recordingStore = RecordingStore(settings: recordingSettings)
+        startRetentionTimer()
+
         // Build tiles/sources from the loaded config (all treated as new).
         applyCameras(Array(Config.load(from: configPath).prefix(maxCameras)))
 
@@ -130,9 +143,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     func applicationWillTerminate(_ notification: Notification) {
         healthTimer?.invalidate()
+        retentionTimer?.invalidate()
         // In-process demux threads are interrupted and wound down here; nothing
         // outlives the app (no subprocess to orphan).
         sources.values.forEach { $0.stop() }
+        // Finalise any in-progress recordings so the last segment is playable
+        // (bounded wait so quit never hangs).
+        let group = DispatchGroup()
+        for rec in recorders.values { group.enter(); rec.stop { group.leave() } }
+        recorders.removeAll()
+        _ = group.wait(timeout: .now() + 2.0)
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
     }
 
@@ -153,42 +173,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     func applyCameras(_ newCameras: [CameraConfig]) {
         let capped = Array(newCameras.prefix(maxCameras))
         let oldById = Dictionary(uniqueKeysWithValues: cameras.map { ($0.id, $0) })
-        // The set of cameras that should have a live tile + stream right now.
-        let shouldShow = Set(capped.filter { $0.showVideoStream }.map { $0.id })
+        // Tiles are shown cameras; streams also include record-only cameras.
+        let shouldShow   = Set(capped.filter { $0.showVideoStream }.map { $0.id })
+        let shouldStream = Set(capped.filter { $0.showVideoStream || $0.recordVideo }.map { $0.id })
 
-        // Remove any camera that currently has a tile but should no longer be shown.
-        // Keying off tilesById (not the id list) covers BOTH deletion and toggle-off.
+        // Stop streams (+ their recorders) for cameras that should no longer stream —
+        // covers deletion and both toggles going off. Keyed off `sources`.
+        for id in Array(sources.keys) where !shouldStream.contains(id) {
+            stopStream(id)
+        }
+        // Remove tiles for cameras that should no longer be shown (a hidden camera
+        // may still stream for recording). Keyed off `tilesById`.
         for (id, tile) in tilesById where !shouldShow.contains(id) {
-            sources[id]?.stop()
-            sources[id] = nil
             tile.removeFromSuperview()
             tilesById[id] = nil
-            statuses[id] = nil
-            lastFrameAt[id] = nil
-            sourceStartedAt[id] = nil
-            lastKickAt[id] = nil
         }
 
         // If the enlarged camera is no longer shown (deleted or hidden), exit solo.
         if let s = soloedId, !shouldShow.contains(s) { exitSolo() }
 
-        // Add / update the shown cameras, building the tile order to match the list.
+        // Add / update streams, recorders, and tiles in list order.
         var orderedTiles: [CameraTileView] = []
-        for cam in capped where cam.showVideoStream {
-            if let old = oldById[cam.id], let tile = tilesById[cam.id] {
-                if old.name != cam.name { tile.updateName(cam.name) }
-                if old.resolvedURL != cam.resolvedURL {
-                    sources[cam.id]?.stop()
+        for cam in capped {
+            let old = oldById[cam.id]
+            // Stream + recorder (needed when shown OR recording).
+            if cam.showVideoStream || cam.recordVideo {
+                if sources[cam.id] == nil {
+                    startCamera(cam)                                   // brand-new stream
+                } else if let old, old.resolvedURL != cam.resolvedURL {
+                    stopStream(cam.id)                                 // url changed → restart
                     startCamera(cam)
+                } else {
+                    reconcileRecorder(cam, old: old)                  // stream stays; toggle/rename recorder
                 }
-                orderedTiles.append(tile)
-            } else {
-                // Newly added OR toggled back on (no tile yet) → start fresh.
-                let tile = CameraTileView(id: cam.id, name: cam.name)
-                tile.onKick = { [weak self] in self?.reconnect(id: cam.id) }
-                tilesById[cam.id] = tile
-                startCamera(cam)
-                orderedTiles.append(tile)
+            }
+            // Tile (shown cameras only).
+            if cam.showVideoStream {
+                if let tile = tilesById[cam.id] {
+                    if old?.name != cam.name { tile.updateName(cam.name) }
+                    orderedTiles.append(tile)
+                } else {
+                    let tile = CameraTileView(id: cam.id, name: cam.name)
+                    tile.onKick = { [weak self] in self?.reconnect(id: cam.id) }
+                    tilesById[cam.id] = tile
+                    orderedTiles.append(tile)
+                }
             }
         }
 
@@ -281,21 +310,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         return source
     }
 
-    /// Create + start a source for one camera and reset its health trackers.
+    /// Create + start a source for one camera and reset its health trackers. Attaches
+    /// a recorder first (before the demux thread starts) when the camera records.
     private func startCamera(_ cam: CameraConfig) {
         let source = makeSource(cam)
+        if cam.recordVideo {
+            let rec = CameraRecorder(cameraName: cam.name, store: recordingStore)
+            recorders[cam.id] = rec
+            source.recorder = rec
+        }
         sources[cam.id] = source
         sourceStartedAt[cam.id] = Date()
         lastFrameAt[cam.id] = nil
         source.start()
     }
 
+    /// Fully stop a camera's stream + recorder and clear its health trackers.
+    private func stopStream(_ id: UUID) {
+        sources[id]?.stop()
+        sources[id] = nil
+        recorders[id]?.stop()      // finalises the in-progress segment
+        recorders[id] = nil
+        statuses[id] = nil
+        lastFrameAt[id] = nil
+        sourceStartedAt[id] = nil
+        lastKickAt[id] = nil
+    }
+
+    /// For a camera whose stream stays up, bring its recorder into line with the
+    /// config: start one when recording turns on, stop one when it turns off, and
+    /// restart it on rename (so new segments use the new camera name/folder).
+    private func reconcileRecorder(_ cam: CameraConfig, old: CameraConfig?) {
+        let existing = recorders[cam.id]
+        if cam.recordVideo {
+            if existing == nil || old?.name != cam.name {
+                existing?.stop()
+                let rec = CameraRecorder(cameraName: cam.name, store: recordingStore)
+                recorders[cam.id] = rec
+                sources[cam.id]?.recorder = rec
+            }
+        } else if let existing {
+            sources[cam.id]?.recorder = nil
+            existing.stop()
+            recorders[cam.id] = nil
+        }
+    }
+
     /// Force a fresh connection for one camera (manual kick button, or auto on stall).
     func reconnect(id: UUID) {
         // Never resurrect a hidden camera (guards against a demux-thread callback
         // arriving right after stop() during a toggle-off).
-        guard let cam = cameras.first(where: { $0.id == id }), cam.showVideoStream else { return }
+        guard let cam = cameras.first(where: { $0.id == id }),
+              cam.showVideoStream || cam.recordVideo else { return }
         sources[id]?.stop()
+        recorders[id]?.stop()          // finalise the segment; startCamera makes a fresh one
+        recorders[id] = nil
         tilesById[id]?.video.flushDisplay()
         lastKickAt[id] = Date()
         setStatus(.connecting, for: id)
@@ -315,6 +384,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         healthTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.checkHealth()
         }
+    }
+
+    // MARK: - Recording retention
+
+    /// Prune expired recordings shortly after launch, then every 10 minutes.
+    private func startRetentionTimer() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in self?.pruneRecordings() }
+        retentionTimer = Timer.scheduledTimer(withTimeInterval: 600, repeats: true) { [weak self] _ in
+            self?.pruneRecordings()
+        }
+    }
+
+    /// Delete recordings older than the retention window (off the main thread). The
+    /// active-segment paths are just belt-and-suspenders — freshly written files are
+    /// hours from the cutoff, so they're never eligible anyway.
+    private func pruneRecordings() {
+        let active = Set(recorders.values.compactMap { $0.activeFinalPath })
+        let store = recordingStore
+        DispatchQueue.global(qos: .utility).async { store.prune(activePaths: active) }
     }
 
     /// Derive each camera's status from how recently a frame arrived, and
@@ -344,7 +432,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     private func persist() {
         do {
-            try Config.save(cameras, to: configPath)
+            try Config.save(cameras, recording: recordingSettings, to: configPath)
         } catch {
             let alert = NSAlert()
             alert.messageText = "Could not save cameras.json"
@@ -633,7 +721,50 @@ final class UpdateProgressPanel {
     func close() { parent.endSheet(sheet) }
 }
 
+/// Hidden self-test: run the record path (H264Parser → CameraRecorder) over an
+/// Annex-B H.264 file, no GUI/network — deterministic regression coverage for
+/// recording. Usage:  LocalVideoNative --selftest-record <in.h264> <outDir> <segSeconds>
+func runRecordSelfTest(_ args: [String]) -> Never {
+    guard args.count >= 3 else {
+        FileHandle.standardError.write("usage: --selftest-record <in.h264> <outDir> <segSeconds>\n".data(using: .utf8)!)
+        exit(2)
+    }
+    let inPath = args[0], outDir = args[1]
+    let seg = Int(args[2]) ?? 60
+    // Optional 4th arg: spread the feed over this many seconds to mimic a real-time
+    // stream (host-clock PTS ⇒ segment length & file duration track wall-clock).
+    let paceSeconds = args.count >= 4 ? (Double(args[3]) ?? 0) : 0
+    guard let data = FileManager.default.contents(atPath: inPath) else {
+        FileHandle.standardError.write("cannot read \(inPath)\n".data(using: .utf8)!); exit(2)
+    }
+    let store = RecordingStore(settings: RecordingSettings(directory: outDir, retentionHours: 48, segmentSeconds: seg))
+    let recorder = CameraRecorder(cameraName: "SelfTest", store: store)
+    let parser = H264Parser()
+    parser.onSampleBuffer = { sb in recorder.queue.async { recorder.append(sb) } }
+
+    // Feed in small chunks to mimic streamed reads; pace them if requested.
+    let chunk = paceSeconds > 0 ? 4 * 1024 : 16 * 1024
+    let chunks = (data.count + chunk - 1) / chunk
+    let perChunkSleep = paceSeconds > 0 ? paceSeconds / Double(max(1, chunks)) : 0
+    var offset = 0
+    while offset < data.count {
+        let end = min(offset + chunk, data.count)
+        parser.append(data.subdata(in: offset..<end))
+        offset = end
+        if perChunkSleep > 0 { Thread.sleep(forTimeInterval: perChunkSleep) }
+    }
+    let done = DispatchSemaphore(value: 0)
+    recorder.stop { done.signal() }
+    _ = done.wait(timeout: .now() + 15)
+    Thread.sleep(forTimeInterval: 1.5)   // let earlier segments' async finalize/rename settle
+    FileHandle.standardError.write("selftest-record: done\n".data(using: .utf8)!)
+    exit(0)
+}
+
 // --- CLI: optional cameras.json path ---
+if let i = CommandLine.arguments.firstIndex(of: "--selftest-record") {
+    runRecordSelfTest(Array(CommandLine.arguments.dropFirst(i + 1)))
+}
 let configArg = Array(CommandLine.arguments.dropFirst()).first
 
 let app = NSApplication.shared

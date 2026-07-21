@@ -17,6 +17,10 @@ final class RTSPSource {
     var onSampleBuffer: ((CMSampleBuffer) -> Void)?
     /// Called when the stream's status changes.
     var onStatus: ((StreamStatus) -> Void)?
+    /// Optional recorder fed the same frames (on its own queue). Set before `start()`
+    /// and left in place for the source's lifetime; the recorder's own `active` flag
+    /// makes a late frame after stop() a no-op, so no locking is needed here.
+    var recorder: CameraRecorder?
 
     private let url: String
     private let parser = H264Parser()
@@ -37,6 +41,10 @@ final class RTSPSource {
                 self.onStatus?(.streaming)
             }
             self.onSampleBuffer?(sb)
+            // Fan out to the recorder on its own queue — never blocks display/demux.
+            if let rec = self.recorder {
+                rec.queue.async { rec.append(sb) }
+            }
         }
     }
 
