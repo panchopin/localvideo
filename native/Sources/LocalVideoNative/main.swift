@@ -58,6 +58,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var soloedId: UUID?
     private var preSoloLayout: LayoutMode?
 
+    // Update-check state (main thread only). Guards against overlapping checks.
+    private var updateCheckInFlight = false
+
     private let configPathArg: String?
 
     init(configPathArg: String?) {
@@ -115,6 +118,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
         startHealthTimer()
         NSApp.activate(ignoringOtherApps: true)
+
+        // Silent update check a few seconds after launch: only surfaces UI if a
+        // newer release exists. Skipped for non-bundle dev runs (`swift run`).
+        if Bundle.main.bundlePath.hasSuffix(".app") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+                self?.checkForUpdates(userInitiated: false)
+            }
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -183,6 +194,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
         cameras = capped
         grid.setTiles(orderedTiles)
+        refreshSoloIndicators()
         updateLayout()
         updateEmptyState()
         persist()
@@ -225,6 +237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             soloedId = tile.cameraId
             grid.setSolo(tile)
         }
+        refreshSoloIndicators()
     }
 
     private func exitSolo() {
@@ -236,6 +249,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             updateLayout()
         }
         preSoloLayout = nil
+        refreshSoloIndicators()
+    }
+
+    /// Sync each tile's expand/retract button icon to the current solo state.
+    private func refreshSoloIndicators() {
+        for tile in grid.tiles { tile.setSolo(tile.cameraId == soloedId) }
     }
 
     private func makeSource(_ camera: CameraConfig) -> RTSPSource {
@@ -362,6 +381,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             soloedId = nil
             preSoloLayout = nil
             grid.setSolo(nil)
+            refreshSoloIndicators()
         }
         layoutMode = mode
         updateLayout()
@@ -377,6 +397,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         mainMenu.addItem(appItem)
         let appMenu = NSMenu()
         appItem.submenu = appMenu
+        appMenu.addItem(withTitle: "Check for Updates…", action: #selector(checkForUpdatesMenu), keyEquivalent: "")
         appMenu.addItem(withTitle: "Preferences…", action: #selector(openPreferences), keyEquivalent: ",")
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Quit LocalVideo", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -439,6 +460,97 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         window.toggleFullScreen(nil)
     }
 
+    // MARK: - Updates (consults the public GitHub Releases)
+
+    @objc private func checkForUpdatesMenu() { checkForUpdates(userInitiated: true) }
+
+    /// Ask GitHub for the latest release. A user-initiated check reports "up to
+    /// date" and errors; the silent launch check only surfaces UI when newer.
+    private func checkForUpdates(userInitiated: Bool) {
+        guard !updateCheckInFlight else { return }
+        updateCheckInFlight = true
+        Updater.fetchLatestRelease { [weak self] result in
+            guard let self else { return }
+            self.updateCheckInFlight = false
+            switch result {
+            case .success(let release):
+                if Updater.isNewer(release.version, than: Updater.currentVersion) {
+                    self.promptForUpdate(release)
+                } else if userInitiated {
+                    self.infoAlert("You're up to date",
+                                   "LocalVideo \(Updater.currentVersion) is the latest version.")
+                }
+            case .failure(let error):
+                if userInitiated {
+                    self.infoAlert("Couldn't check for updates", error.localizedDescription)
+                }   // silent launch checks fail quietly
+            }
+        }
+    }
+
+    private func promptForUpdate(_ release: Updater.Release) {
+        let alert = NSAlert()
+        alert.messageText = "Update available: LocalVideo \(release.version)"
+        var info = "You have \(Updater.currentVersion). Update now? The app will restart."
+        let notes = release.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !notes.isEmpty {
+            let clipped = notes.count > 600 ? String(notes.prefix(600)) + "…" : notes
+            info += "\n\nWhat's new:\n" + clipped
+        }
+        alert.informativeText = info
+        alert.addButton(withTitle: "Update Now")
+        alert.addButton(withTitle: "Later")
+        if alert.runModal() == .alertFirstButtonReturn {
+            performUpdate(release)
+        }
+    }
+
+    private func performUpdate(_ release: Updater.Release) {
+        guard Bundle.main.bundlePath.hasSuffix(".app") else {
+            openReleasePage(release, reason: Updater.UpdaterError.notABundle.localizedDescription)
+            return
+        }
+        let panel = UpdateProgressPanel(over: window, version: release.version)
+        panel.show()
+        Updater.download(release, progress: { p in
+            panel.setProgress(p)
+        }, completion: { [weak self] result in
+            switch result {
+            case .success(let zipURL):
+                panel.setInstalling()
+                do {
+                    try Updater.installAndRelaunch(zipAt: zipURL)   // quits the app on success
+                } catch {
+                    panel.close()
+                    self?.openReleasePage(release, reason: error.localizedDescription)
+                }
+            case .failure(let error):
+                panel.close()
+                self?.openReleasePage(release, reason: error.localizedDescription)
+            }
+        })
+    }
+
+    /// Fallback when the in-app install can't proceed: offer the release page so the
+    /// user can grab the zip by hand.
+    private func openReleasePage(_ release: Updater.Release, reason: String) {
+        let alert = NSAlert()
+        alert.messageText = "Automatic update didn't complete"
+        alert.informativeText = reason + "\n\nYou can download it manually from the release page."
+        alert.addButton(withTitle: "Open Release Page")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(release.htmlURL)
+        }
+    }
+
+    private func infoAlert(_ title: String, _ text: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = text
+        alert.runModal()
+    }
+
     @objc private func setAutoLayout() {
         setLayoutMode(.auto)
     }
@@ -482,6 +594,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             }
         }
     }
+}
+
+/// A minimal sheet shown over the main window during an update download/install:
+/// a title line and a determinate progress bar (indeterminate while installing).
+final class UpdateProgressPanel {
+    private let parent: NSWindow
+    private let sheet: NSWindow
+    private let bar = NSProgressIndicator()
+    private let label = NSTextField(labelWithString: "")
+
+    init(over parent: NSWindow, version: String) {
+        self.parent = parent
+        sheet = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 380, height: 96),
+                         styleMask: [.titled], backing: .buffered, defer: false)
+        let content = sheet.contentView!
+
+        label.stringValue = "Downloading LocalVideo \(version)…"
+        label.font = .systemFont(ofSize: 13, weight: .medium)
+        label.frame = NSRect(x: 20, y: 54, width: 340, height: 20)
+        content.addSubview(label)
+
+        bar.frame = NSRect(x: 20, y: 26, width: 340, height: 18)
+        bar.isIndeterminate = false
+        bar.minValue = 0
+        bar.maxValue = 1
+        bar.style = .bar
+        content.addSubview(bar)
+    }
+
+    func show() { parent.beginSheet(sheet, completionHandler: nil) }
+    func setProgress(_ p: Double) { bar.isIndeterminate = false; bar.doubleValue = p }
+    func setInstalling() {
+        label.stringValue = "Installing update…"
+        bar.isIndeterminate = true
+        bar.startAnimation(nil)
+    }
+    func close() { parent.endSheet(sheet) }
 }
 
 // --- CLI: optional cameras.json path ---

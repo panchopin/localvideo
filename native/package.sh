@@ -21,6 +21,15 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$FRAMEWORKS"
 cp "$ROOT/.build/release/LocalVideoNative" "$MACOS"
 cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
+
+# Stamp the marketing version from the release tag (set by release.yml) so the
+# in-app updater's version compare matches the release it came from. Local builds
+# leave the Info.plist default untouched.
+if [ -n "${LOCALVIDEO_VERSION:-}" ]; then
+    VER="${LOCALVIDEO_VERSION#v}"   # strip a leading "v" (v0.2.0 -> 0.2.0)
+    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VER" "$APP/Contents/Info.plist"
+    echo "==> Stamped CFBundleShortVersionString=$VER"
+fi
 if [ -f "$ROOT/Resources/AppIcon.icns" ]; then
     cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 fi

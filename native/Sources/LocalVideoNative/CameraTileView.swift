@@ -22,6 +22,10 @@ final class CameraTileView: NSView {
     private var baseName: String = ""
     private let statusDot = NSView()
     private let kickButton = NSButton()
+    /// Enlarge/restore toggle (same effect as double-click). Icon flips between
+    /// 4-arrows-outward (expand) and 4-arrows-inward (retract) with solo state.
+    private let expandButton = NSButton()
+    private var isSolo = false
     private var status: StreamStatus = .connecting
     private var hoverArea: NSTrackingArea?
 
@@ -87,6 +91,15 @@ final class CameraTileView: NSView {
         kickButton.target = self
         kickButton.action = #selector(kickTapped)
         addSubview(kickButton)
+
+        expandButton.isHidden = true
+        expandButton.bezelStyle = .circular
+        expandButton.imagePosition = .imageOnly
+        expandButton.image = CameraTileView.fourArrowImage(outward: true)
+        expandButton.toolTip = "Enlarge (double-click)"
+        expandButton.target = self
+        expandButton.action = #selector(expandTapped)
+        addSubview(expandButton)
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
@@ -105,9 +118,12 @@ final class CameraTileView: NSView {
         let labelW = min(nameLabel.frame.width + 10, max(0, bounds.width - labelX - pad))
         nameLabel.frame = NSRect(x: labelX, y: pad, width: labelW, height: labelH)
 
-        // Reconnect button: bottom-right corner (AppKit origin is bottom-left).
+        // Hover controls: reconnect in the bottom-right corner, enlarge/restore to
+        // its left (AppKit origin is bottom-left).
         let btn: CGFloat = 26
+        let gap: CGFloat = 6
         kickButton.frame = NSRect(x: bounds.width - btn - 6, y: 6, width: btn, height: btn)
+        expandButton.frame = NSRect(x: bounds.width - btn * 2 - gap - 6, y: 6, width: btn, height: btn)
     }
 
     // MARK: - Mouse routing
@@ -121,6 +137,9 @@ final class CameraTileView: NSView {
         guard bounds.contains(local) else { return nil }
         if !kickButton.isHidden, kickButton.frame.contains(local) {
             return kickButton
+        }
+        if !expandButton.isHidden, expandButton.frame.contains(local) {
+            return expandButton
         }
         return self
     }
@@ -218,16 +237,34 @@ final class CameraTileView: NSView {
     }
 
     override func mouseEntered(with event: NSEvent) {
-        if !hoverSuppressed { kickButton.isHidden = false }
+        if !hoverSuppressed { kickButton.isHidden = false; expandButton.isHidden = false }
     }
-    override func mouseExited(with event: NSEvent) { kickButton.isHidden = true }
+    override func mouseExited(with event: NSEvent) {
+        kickButton.isHidden = true
+        expandButton.isHidden = true
+    }
 
     @objc private func kickTapped() { onKick?() }
 
+    /// Enlarge/restore this tile — same effect as a double-click.
+    @objc private func expandTapped() { interactionDelegate?.tileRequestedSoloToggle(self) }
+
+    /// Reflect whether this tile is currently enlarged (solo): flips the button
+    /// icon between expand (4 arrows out) and retract (4 arrows in).
+    func setSolo(_ on: Bool) {
+        guard isSolo != on else { return }
+        isSolo = on
+        expandButton.image = CameraTileView.fourArrowImage(outward: !on)
+        expandButton.toolTip = on ? "Restore grid (double-click)" : "Enlarge (double-click)"
+    }
+
     // MARK: - Drag visuals (driven by the grid)
 
-    /// Force-hide the kick button (used when a drag starts).
-    func hideKick() { kickButton.isHidden = true }
+    /// Force-hide the hover controls (used when a drag starts).
+    func hideHoverControls() {
+        kickButton.isHidden = true
+        expandButton.isHidden = true
+    }
 
     /// Toggle the accent drop-target highlight border.
     func setDropHighlight(_ on: Bool) {
@@ -255,5 +292,52 @@ final class CameraTileView: NSView {
         guard newStatus != status else { return }
         status = newStatus
         statusDot.layer?.backgroundColor = newStatus.color.cgColor
+    }
+
+    // MARK: - Expand/retract icon
+
+    /// A four-arrow glyph drawn along the diagonals: arrows point out toward the
+    /// corners (`outward` — expand) or in toward the center (retract). Rendered as
+    /// a template image so the circular button tints it like a system control.
+    /// (SF Symbols has a 4-arrows-out symbol but no matching 4-arrows-in one.)
+    private static func fourArrowImage(outward: Bool, side: CGFloat = 16) -> NSImage {
+        func unit(_ v: NSPoint) -> NSPoint {
+            let m = (v.x * v.x + v.y * v.y).squareRoot()
+            return m == 0 ? v : NSPoint(x: v.x / m, y: v.y / m)
+        }
+        func rot(_ v: NSPoint, _ deg: CGFloat) -> NSPoint {
+            let r = deg * .pi / 180
+            return NSPoint(x: v.x * cos(r) - v.y * sin(r), y: v.x * sin(r) + v.y * cos(r))
+        }
+        let img = NSImage(size: NSSize(width: side, height: side), flipped: false) { _ in
+            let path = NSBezierPath()
+            path.lineWidth = 1.5
+            path.lineCapStyle = .round
+            path.lineJoinStyle = .round
+            NSColor.black.setStroke()   // color ignored — template image uses alpha only
+
+            let c = NSPoint(x: side / 2, y: side / 2)
+            let pad: CGFloat = 2.5
+            let gap: CGFloat = 3.4       // half-length of the empty center
+            let head: CGFloat = 3.6      // arrowhead barb length
+            let corners = [NSPoint(x: pad, y: pad), NSPoint(x: side - pad, y: pad),
+                           NSPoint(x: pad, y: side - pad), NSPoint(x: side - pad, y: side - pad)]
+            for corner in corners {
+                let dOut = unit(NSPoint(x: corner.x - c.x, y: corner.y - c.y))   // center → corner
+                let inner = NSPoint(x: c.x + dOut.x * gap, y: c.y + dOut.y * gap)
+                path.move(to: inner); path.line(to: corner)                      // shaft
+                let tip = outward ? corner : inner
+                let pointDir = outward ? dOut : NSPoint(x: -dOut.x, y: -dOut.y)   // way the arrow points
+                let back = NSPoint(x: -pointDir.x, y: -pointDir.y)
+                for barb in [rot(back, 32), rot(back, -32)] {
+                    path.move(to: tip)
+                    path.line(to: NSPoint(x: tip.x + barb.x * head, y: tip.y + barb.y * head))
+                }
+            }
+            path.stroke()
+            return true
+        }
+        img.isTemplate = true
+        return img
     }
 }

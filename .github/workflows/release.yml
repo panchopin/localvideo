@@ -24,6 +24,8 @@ jobs:
         run: brew install ffmpeg
 
       - name: Build self-contained app bundle
+        env:
+          LOCALVIDEO_VERSION: ${{ github.ref_name }}   # e.g. v0.2.0 -> stamps 0.2.0
         run: bash native/package.sh
 
       - name: Zip the app

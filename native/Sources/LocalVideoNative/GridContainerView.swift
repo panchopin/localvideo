@@ -111,7 +111,7 @@ final class GridContainerView: NSView, CameraTileInteractionDelegate {
         isDragging = true
         dragSourceTile = tile
         tile.layer?.opacity = 0.3
-        tiles.forEach { $0.hoverSuppressed = true; $0.hideKick() }
+        tiles.forEach { $0.hoverSuppressed = true; $0.hideHoverControls() }
 
         let g = makeGhost(name: tile.cameraName, tileSize: tile.frame.size)
         layer?.addSublayer(g)
