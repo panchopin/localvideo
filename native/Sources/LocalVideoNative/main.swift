@@ -405,6 +405,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         DispatchQueue.global(qos: .utility).async { store.prune(activePaths: active) }
     }
 
+    /// Apply changed global recording settings (folder / retention / segment length):
+    /// update the store, restart any active recorders so the new folder + segment
+    /// length take effect on their next file, persist. Called from Preferences.
+    func updateRecordingSettings(_ new: RecordingSettings) {
+        guard new != recordingSettings else { return }
+        recordingSettings = new
+        recordingStore.updateSettings(new)
+        for id in Array(recorders.keys) {
+            recorders[id]?.stop()
+            recorders[id] = nil
+            if let cam = cameras.first(where: { $0.id == id }), let src = sources[id] {
+                let rec = CameraRecorder(cameraName: cam.name, store: recordingStore)
+                recorders[id] = rec
+                src.recorder = rec
+            }
+        }
+        persist()
+    }
+
     /// Derive each camera's status from how recently a frame arrived, and
     /// auto-kick a stalled stream (with a cooldown so we don't thrash).
     private func checkHealth() {
