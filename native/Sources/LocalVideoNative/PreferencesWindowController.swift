@@ -17,6 +17,11 @@ final class PreferencesWindowController: NSWindowController, NSTableViewDataSour
     private let userField = NSTextField()
     private let passField = NSSecureTextField()
     private let showStreamCheckbox = NSButton()
+    private let recordCheckbox = NSButton()
+    private let recordAudioCheckbox = NSButton()
+    private let folderValueLabel = NSTextField(labelWithString: "")
+    private let chooseFolderButton = NSButton()
+    private let retentionField = NSTextField()
     private let errorLabel = NSTextField(labelWithString: "")
     private let saveButton = NSButton()
     private let addButton = NSButton()
@@ -28,7 +33,7 @@ final class PreferencesWindowController: NSWindowController, NSTableViewDataSour
 
     init(app: AppDelegate) {
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 620, height: 400),
+            contentRect: NSRect(x: 0, y: 0, width: 620, height: 486),
             styleMask: [.titled, .closable, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -53,7 +58,7 @@ final class PreferencesWindowController: NSWindowController, NSTableViewDataSour
         // ---- Left: camera list ----
         let listHeader = NSTextField(labelWithString: "Cameras")
         listHeader.font = .boldSystemFont(ofSize: 12)
-        listHeader.frame = NSRect(x: 16, y: 372, width: 240, height: 16)
+        listHeader.frame = NSRect(x: 16, y: 458, width: 240, height: 16)
         content.addSubview(listHeader)
 
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("camera"))
@@ -65,50 +70,64 @@ final class PreferencesWindowController: NSWindowController, NSTableViewDataSour
         tableView.delegate = self
         tableView.allowsEmptySelection = true
 
-        scrollView.frame = NSRect(x: 16, y: 52, width: 240, height: 312)
+        scrollView.frame = NSRect(x: 16, y: 138, width: 240, height: 312)
         scrollView.documentView = tableView
         scrollView.hasVerticalScroller = true
         scrollView.borderType = .bezelBorder
         content.addSubview(scrollView)
 
         configureButton(addButton, title: "+", action: #selector(addCamera))
-        addButton.frame = NSRect(x: 16, y: 14, width: 30, height: 28)
+        addButton.frame = NSRect(x: 16, y: 100, width: 30, height: 28)
         content.addSubview(addButton)
 
         configureButton(deleteButton, title: "−", action: #selector(deleteSelected))
-        deleteButton.frame = NSRect(x: 50, y: 14, width: 30, height: 28)
+        deleteButton.frame = NSRect(x: 50, y: 100, width: 30, height: 28)
         content.addSubview(deleteButton)
 
         configureButton(scanButton, title: "Scan Network…", action: #selector(scanNetwork))
-        scanButton.frame = NSRect(x: 86, y: 14, width: 156, height: 28)
+        scanButton.frame = NSRect(x: 86, y: 100, width: 156, height: 28)
         content.addSubview(scanButton)
 
         // ---- Right: edit form ----
         let formHeader = NSTextField(labelWithString: "Edit Camera")
         formHeader.font = .boldSystemFont(ofSize: 12)
-        formHeader.frame = NSRect(x: 272, y: 372, width: 332, height: 16)
+        formHeader.frame = NSRect(x: 272, y: 458, width: 332, height: 16)
         content.addSubview(formHeader)
 
-        addLabel("Name", x: 272, y: 346, to: content)
-        configureField(nameField, placeholder: "Camera name", x: 272, y: 322, to: content)
+        addLabel("Name", x: 272, y: 432, to: content)
+        configureField(nameField, placeholder: "Camera name", x: 272, y: 408, to: content)
 
-        addLabel("URL", x: 272, y: 296, to: content)
-        configureField(urlField, placeholder: "rtsp://host/path", x: 272, y: 272, to: content)
+        addLabel("URL", x: 272, y: 382, to: content)
+        configureField(urlField, placeholder: "rtsp://host/path", x: 272, y: 358, to: content)
 
-        addLabel("Username", x: 272, y: 246, to: content)
-        configureField(userField, placeholder: "Optional", x: 272, y: 222, to: content)
+        addLabel("Username", x: 272, y: 332, to: content)
+        configureField(userField, placeholder: "Optional", x: 272, y: 308, to: content)
 
-        addLabel("Password", x: 272, y: 196, to: content)
-        configureField(passField, placeholder: "Optional", x: 272, y: 172, to: content)
+        addLabel("Password", x: 272, y: 282, to: content)
+        configureField(passField, placeholder: "Optional", x: 272, y: 258, to: content)
 
-        // "Show video stream" checkbox: when off, the camera stays configured but
-        // is not streamed/shown in the grid. Applied on Save (no live action).
+        // "Show video stream" / "Record video" — half-width, side by side. Show off ⇒
+        // configured but not shown; Record on ⇒ saved to disk (works even when hidden).
         showStreamCheckbox.setButtonType(.switch)
         showStreamCheckbox.title = "Show video stream"
-        showStreamCheckbox.frame = NSRect(x: 272, y: 146, width: 332, height: 18)
+        showStreamCheckbox.frame = NSRect(x: 272, y: 232, width: 155, height: 18)
         content.addSubview(showStreamCheckbox)
 
-        errorLabel.frame = NSRect(x: 272, y: 104, width: 332, height: 40)
+        recordCheckbox.setButtonType(.switch)
+        recordCheckbox.title = "Record video"
+        recordCheckbox.frame = NSRect(x: 432, y: 232, width: 172, height: 18)
+        recordCheckbox.target = self
+        recordCheckbox.action = #selector(recordToggled)
+        content.addSubview(recordCheckbox)
+
+        // "Record audio" — sub-option of Record video (indented, only enabled when
+        // Record video is on). Wyze audio is G.711 → saved as PCM in a .mov.
+        recordAudioCheckbox.setButtonType(.switch)
+        recordAudioCheckbox.title = "Record audio"
+        recordAudioCheckbox.frame = NSRect(x: 452, y: 210, width: 152, height: 18)
+        content.addSubview(recordAudioCheckbox)
+
+        errorLabel.frame = NSRect(x: 272, y: 160, width: 332, height: 38)
         errorLabel.textColor = .systemRed
         errorLabel.font = .systemFont(ofSize: 11)
         errorLabel.maximumNumberOfLines = 3
@@ -116,9 +135,41 @@ final class PreferencesWindowController: NSWindowController, NSTableViewDataSour
         content.addSubview(errorLabel)
 
         configureButton(saveButton, title: "Save", action: #selector(saveForm))
-        saveButton.frame = NSRect(x: 504, y: 14, width: 100, height: 30)
+        saveButton.frame = NSRect(x: 504, y: 100, width: 100, height: 30)
         saveButton.keyEquivalent = "\r"
         content.addSubview(saveButton)
+
+        // ---- Footer: global recording settings (apply immediately) ----
+        let sep = NSBox(frame: NSRect(x: 16, y: 90, width: 588, height: 1))
+        sep.boxType = .separator
+        content.addSubview(sep)
+
+        let recHeader = NSTextField(labelWithString: "Recording (all cameras)")
+        recHeader.font = .boldSystemFont(ofSize: 12)
+        recHeader.frame = NSRect(x: 16, y: 64, width: 400, height: 16)
+        content.addSubview(recHeader)
+
+        addLabel("Folder", x: 16, y: 42, to: content)
+        folderValueLabel.frame = NSRect(x: 68, y: 40, width: 372, height: 16)
+        folderValueLabel.font = .systemFont(ofSize: 11)
+        folderValueLabel.textColor = .labelColor
+        folderValueLabel.lineBreakMode = .byTruncatingMiddle
+        folderValueLabel.toolTip = "Where recordings are saved"
+        content.addSubview(folderValueLabel)
+
+        configureButton(chooseFolderButton, title: "Choose…", action: #selector(chooseFolder))
+        chooseFolderButton.frame = NSRect(x: 448, y: 36, width: 100, height: 26)
+        content.addSubview(chooseFolderButton)
+
+        addLabel("Keep last", x: 16, y: 12, to: content)
+        retentionField.frame = NSRect(x: 84, y: 9, width: 54, height: 22)
+        retentionField.isBezeled = true
+        retentionField.bezelStyle = .roundedBezel
+        retentionField.alignment = .right
+        retentionField.target = self
+        retentionField.action = #selector(retentionChanged)
+        content.addSubview(retentionField)
+        addLabel("hours (deletes older recordings)", x: 144, y: 12, to: content)
     }
 
     private func configureButton(_ button: NSButton, title: String, action: Selector) {
@@ -153,7 +204,16 @@ final class PreferencesWindowController: NSWindowController, NSTableViewDataSour
             tableView.selectRowIndexes([row], byExtendingSelection: false)
         }
         populateForm()
+        refreshGlobalSettings()
         updateButtons()
+    }
+
+    /// Load the global recording settings into the footer controls.
+    private func refreshGlobalSettings() {
+        guard let s = app?.recordingSettings else { return }
+        folderValueLabel.stringValue = s.directory
+        folderValueLabel.toolTip = s.directory
+        retentionField.stringValue = String(s.retentionHours)
     }
 
     /// Refresh just the status dot for one camera's row.
@@ -169,6 +229,8 @@ final class PreferencesWindowController: NSWindowController, NSTableViewDataSour
             userField.stringValue = ""
             passField.stringValue = ""
             showStreamCheckbox.state = .on
+            recordCheckbox.state = .off
+            recordAudioCheckbox.state = .off
             setFormEnabled(false)
             errorLabel.stringValue = ""
             return
@@ -179,13 +241,23 @@ final class PreferencesWindowController: NSWindowController, NSTableViewDataSour
         userField.stringValue = cam.username ?? ""
         passField.stringValue = cam.password ?? ""
         showStreamCheckbox.state = cam.showVideoStream ? .on : .off
+        recordCheckbox.state = cam.recordVideo ? .on : .off
+        recordAudioCheckbox.state = cam.recordAudio ? .on : .off
         errorLabel.stringValue = ""
     }
 
     private func setFormEnabled(_ enabled: Bool) {
         [nameField, urlField, userField, passField].forEach { $0.isEnabled = enabled }
         showStreamCheckbox.isEnabled = enabled
+        recordCheckbox.isEnabled = enabled
         saveButton.isEnabled = enabled
+        // Audio is a sub-option: only settable while Record video is on.
+        recordAudioCheckbox.isEnabled = enabled && recordCheckbox.state == .on
+    }
+
+    /// Keep "Record audio" enabled only while "Record video" is on.
+    @objc private func recordToggled() {
+        recordAudioCheckbox.isEnabled = recordCheckbox.isEnabled && recordCheckbox.state == .on
     }
 
     private func updateButtons() {
@@ -234,10 +306,39 @@ final class PreferencesWindowController: NSWindowController, NSTableViewDataSour
             id: id, name: name, url: url,
             username: user.isEmpty ? nil : user,
             password: pass.isEmpty ? nil : pass,
-            showVideoStream: showStreamCheckbox.state == .on
+            showVideoStream: showStreamCheckbox.state == .on,
+            recordVideo: recordCheckbox.state == .on,
+            recordAudio: recordCheckbox.state == .on && recordAudioCheckbox.state == .on
         )
         showError("")
         app?.applyCameras(list)
+    }
+
+    // MARK: - Global recording settings (footer)
+
+    @objc private func chooseFolder() {
+        guard let win = window, let current = app?.recordingSettings else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Choose"
+        panel.directoryURL = URL(fileURLWithPath: current.directory)
+        panel.beginSheetModal(for: win) { [weak self] resp in
+            guard resp == .OK, let url = panel.url, let self, var s = self.app?.recordingSettings else { return }
+            s.directory = url.path
+            self.app?.updateRecordingSettings(s)
+            self.refreshGlobalSettings()
+        }
+    }
+
+    @objc private func retentionChanged() {
+        guard var s = app?.recordingSettings else { return }
+        let entered = Int(retentionField.stringValue.trimmingCharacters(in: .whitespaces)) ?? s.retentionHours
+        s.retentionHours = max(1, entered)
+        retentionField.stringValue = String(s.retentionHours)   // reflect clamping
+        app?.updateRecordingSettings(s)
     }
 
     @objc private func deleteSelected() {

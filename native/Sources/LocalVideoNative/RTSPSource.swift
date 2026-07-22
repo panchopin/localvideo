@@ -17,6 +17,21 @@ final class RTSPSource {
     var onSampleBuffer: ((CMSampleBuffer) -> Void)?
     /// Called when the stream's status changes.
     var onStatus: ((StreamStatus) -> Void)?
+    /// Optional recorder fed the same frames (on its own queue). Set before `start()`
+    /// and left in place for the source's lifetime; the recorder's own `active` flag
+    /// makes a late frame after stop() a no-op, so no locking is needed here.
+    /// A recorder attached after the audio config already arrived is handed the
+    /// cached config immediately (handles toggling record-audio on mid-stream).
+    var recorder: CameraRecorder? {
+        didSet {
+            if let rec = recorder, let cfg = audioConfig {
+                rec.queue.async { rec.setAudioConfig(cfg) }
+            }
+        }
+    }
+
+    /// Audio format reported once by the demuxer (cached for late-attached recorders).
+    private var audioConfig: AudioStreamConfig?
 
     private let url: String
     private let parser = H264Parser()
@@ -37,6 +52,10 @@ final class RTSPSource {
                 self.onStatus?(.streaming)
             }
             self.onSampleBuffer?(sb)
+            // Fan out to the recorder on its own queue — never blocks display/demux.
+            if let rec = self.recorder {
+                rec.queue.async { rec.append(sb) }
+            }
         }
     }
 
@@ -54,13 +73,24 @@ final class RTSPSource {
         // Keep `self` alive for the lifetime of the thread; balanced in handleRunEnded.
         let ctx = Unmanaged.passRetained(self).toOpaque()
         let t = Thread {
-            // C callback: no captures allowed. Routes bytes to the owning source's parser.
-            let cb: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int32) -> Void = { userdata, bytes, len in
+            // C callbacks: no captures allowed — route through `userdata` (the source).
+            let videoCb: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int32) -> Void = { userdata, bytes, len in
                 guard let userdata, let bytes, len > 0 else { return }
                 let src = Unmanaged<RTSPSource>.fromOpaque(userdata).takeUnretainedValue()
                 src.parser.append(Data(bytes: bytes, count: Int(len)))
             }
-            _ = rtsp_demux_run(d, cb, ctx)
+            let audioCfgCb: @convention(c) (UnsafeMutableRawPointer?, Int32, Int32, Int32, UnsafePointer<UInt8>?, Int32) -> Void = { userdata, fmt, rate, ch, asc, ascLen in
+                guard let userdata else { return }
+                let src = Unmanaged<RTSPSource>.fromOpaque(userdata).takeUnretainedValue()
+                let ascBytes: [UInt8] = (asc != nil && ascLen > 0) ? Array(UnsafeBufferPointer(start: asc, count: Int(ascLen))) : []
+                src.handleAudioConfig(fmt: Int(fmt), sampleRate: Int(rate), channels: Int(ch), asc: ascBytes)
+            }
+            let audioCb: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int32) -> Void = { userdata, bytes, len in
+                guard let userdata, let bytes, len > 0 else { return }
+                let src = Unmanaged<RTSPSource>.fromOpaque(userdata).takeUnretainedValue()
+                src.handleAudioPacket(Data(bytes: bytes, count: Int(len)))
+            }
+            _ = rtsp_demux_run(d, videoCb, audioCfgCb, audioCb, ctx)
             // Hand the demuxer pointer back to the main thread for teardown so the
             // pointer lifecycle stays single-threaded.
             DispatchQueue.main.async {
@@ -72,6 +102,20 @@ final class RTSPSource {
         t.stackSize = 1 << 20
         thread = t
         t.start()
+    }
+
+    // Audio handlers (called on the demux thread).
+
+    private func handleAudioConfig(fmt: Int, sampleRate: Int, channels: Int, asc: [UInt8]) {
+        let format = AudioStreamConfig.Format(rawValue: fmt) ?? .none
+        let cfg = AudioStreamConfig(format: format, sampleRate: sampleRate, channels: channels, asc: asc)
+        audioConfig = cfg
+        if let rec = recorder { rec.queue.async { rec.setAudioConfig(cfg) } }
+    }
+
+    private func handleAudioPacket(_ data: Data) {
+        guard let rec = recorder else { return }
+        rec.queue.async { rec.appendAudio(data) }
     }
 
     /// The run loop returned (error/EOF, or because stop() was requested). Runs on

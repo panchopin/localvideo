@@ -17,6 +17,10 @@ final class H264Parser {
     private var sps: [UInt8]?
     private var pps: [UInt8]?
     private var formatDesc: CMFormatDescription?
+    /// Last presentation timestamp handed out, to keep PTS strictly increasing even
+    /// when several frames are parsed within the same host-clock instant (bursts on
+    /// connect). Non-monotonic timestamps make the muxed MP4's DTS invalid.
+    private var lastPTS: CMTime = .invalid
 
     /// Append freshly read bytes and emit any complete sample buffers.
     func append(_ data: Data) {
@@ -89,7 +93,12 @@ final class H264Parser {
             rebuildFormatDescription()
         case 1, 5:  // non-IDR / IDR slice → a displayable picture
             guard let fmt = formatDesc else { return }  // wait for SPS+PPS first
-            if let sb = Self.makeSampleBuffer(nal: nal, formatDesc: fmt) {
+            var pts = CMClockGetTime(CMClockGetHostTimeClock())
+            if lastPTS.isValid, CMTimeCompare(pts, lastPTS) <= 0 {
+                pts = CMTimeAdd(lastPTS, CMTime(value: 1, timescale: pts.timescale))  // keep it strictly increasing
+            }
+            lastPTS = pts
+            if let sb = Self.makeSampleBuffer(nal: nal, formatDesc: fmt, isKeyframe: type == 5, pts: pts) {
                 onSampleBuffer?(sb)
             }
         default:
@@ -123,9 +132,12 @@ final class H264Parser {
         if let fmt { formatDesc = fmt }
     }
 
-    /// Wrap a single Annex-B NAL into an AVCC CMSampleBuffer tagged for
-    /// immediate display.
-    private static func makeSampleBuffer(nal: [UInt8], formatDesc: CMFormatDescription) -> CMSampleBuffer? {
+    /// Wrap a single Annex-B NAL into an AVCC CMSampleBuffer tagged for immediate
+    /// display. Also carries a host-clock presentation timestamp and a sync/keyframe
+    /// flag: live display ignores both (DisplayImmediately overrides scheduling), but
+    /// the recorder (AVAssetWriter passthrough) needs the timing + keyframe markers to
+    /// mux a seekable, keyframe-aligned MP4. See docs/RECORDING_SPEC.md §4.
+    private static func makeSampleBuffer(nal: [UInt8], formatDesc: CMFormatDescription, isKeyframe: Bool, pts: CMTime) -> CMSampleBuffer? {
         // AVCC framing: 4-byte big-endian length prefix + NAL bytes.
         let length = UInt32(nal.count)
         var avcc = [UInt8]()
@@ -160,6 +172,15 @@ final class H264Parser {
         }
         guard status == kCMBlockBufferNoErr else { return nil }
 
+        // Host-clock presentation time (strictly increasing, set by the caller) so
+        // the recorder can mux with real, monotonic timing. Display ignores it —
+        // DisplayImmediately renders on arrival regardless.
+        var timing = CMSampleTimingInfo(
+            duration: .invalid,
+            presentationTimeStamp: pts,
+            decodeTimeStamp: .invalid   // no B-frames → decode order == presentation order
+        )
+
         var sampleBuffer: CMSampleBuffer?
         var sampleSize = avcc.count
         status = CMSampleBufferCreateReady(
@@ -167,24 +188,32 @@ final class H264Parser {
             dataBuffer: bb,
             formatDescription: formatDesc,
             sampleCount: 1,
-            sampleTimingEntryCount: 0,
-            sampleTimingArray: nil,
+            sampleTimingEntryCount: 1,
+            sampleTimingArray: &timing,
             sampleSizeEntryCount: 1,
             sampleSizeArray: &sampleSize,
             sampleBufferOut: &sampleBuffer
         )
         guard status == noErr, let sb = sampleBuffer else { return nil }
 
-        // Tag for immediate display — no presentation-time queueing.
         if let attachments = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: true),
            CFArrayGetCount(attachments) > 0 {
             let raw = CFArrayGetValueAtIndex(attachments, 0)
             let dict = unsafeBitCast(raw, to: CFMutableDictionary.self)
+            // Tag for immediate display — no presentation-time queueing.
             CFDictionarySetValue(
                 dict,
                 Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
                 Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
             )
+            // Mark non-IDR slices as not-sync so the recorder/players know keyframes.
+            if !isKeyframe {
+                CFDictionarySetValue(
+                    dict,
+                    Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(),
+                    Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+                )
+            }
         }
 
         return sb

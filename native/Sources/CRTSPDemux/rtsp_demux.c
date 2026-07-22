@@ -44,8 +44,22 @@ void rtsp_demux_free(RTSPDemux *d) {
     avformat_network_deinit();
 }
 
-int rtsp_demux_run(RTSPDemux *d, rtsp_demux_data_cb on_data, void *userdata) {
-    if (!d || !on_data) return -1;
+/* Map an AVCodecID to our small audio-format enum (0 = unsupported). */
+static int audio_fmt_of(enum AVCodecID id) {
+    switch (id) {
+        case AV_CODEC_ID_PCM_ALAW:  return RTSP_AUDIO_ALAW;
+        case AV_CODEC_ID_PCM_MULAW: return RTSP_AUDIO_ULAW;
+        case AV_CODEC_ID_AAC:       return RTSP_AUDIO_AAC;
+        default:                    return RTSP_AUDIO_NONE;
+    }
+}
+
+int rtsp_demux_run(RTSPDemux *d,
+                   rtsp_demux_data_cb on_video,
+                   rtsp_demux_audio_cfg_cb on_audio_cfg,
+                   rtsp_demux_audio_cb on_audio,
+                   void *userdata) {
+    if (!d || !on_video) return -1;
 
     int ret = 0;
     AVFormatContext *fmt = avformat_alloc_context();
@@ -72,6 +86,25 @@ int rtsp_demux_run(RTSPDemux *d, rtsp_demux_data_cb on_data, void *userdata) {
     if (vidx < 0) { ret = vidx; goto done; }
     AVCodecParameters *par = fmt->streams[vidx]->codecpar;
 
+    /* Optional audio stream. Report its config once up front (before packets) so
+     * the recorder knows whether to open an audio track. Unsupported codecs and
+     * "no audio" both report RTSP_AUDIO_NONE. */
+    int aidx = -1;
+    if (on_audio_cfg || on_audio) {
+        aidx = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+    }
+    if (on_audio_cfg) {
+        if (aidx >= 0) {
+            AVCodecParameters *apar = fmt->streams[aidx]->codecpar;
+            int afmt = audio_fmt_of(apar->codec_id);
+            on_audio_cfg(userdata, afmt, apar->sample_rate, apar->ch_layout.nb_channels,
+                         apar->extradata, apar->extradata_size);
+            if (afmt == RTSP_AUDIO_NONE) aidx = -1;   /* don't stream packets we can't use */
+        } else {
+            on_audio_cfg(userdata, RTSP_AUDIO_NONE, 0, 0, NULL, 0);
+        }
+    }
+
     /* Reproduce the old `-bsf:v dump_extra=freq=keyframe` (SPS/PPS before every
      * keyframe). If the stream is AVCC (length-prefixed) rather than Annex-B,
      * prepend h264_mp4toannexb so H264Parser still sees start codes — matching
@@ -96,6 +129,11 @@ int rtsp_demux_run(RTSPDemux *d, rtsp_demux_data_cb on_data, void *userdata) {
         ret = av_read_frame(fmt, pkt);
         if (ret < 0) break; /* EOF, error, or interrupted by stop */
 
+        if (pkt->stream_index == aidx) {
+            if (on_audio && pkt->size > 0) on_audio(userdata, pkt->data, pkt->size);
+            av_packet_unref(pkt);
+            continue;
+        }
         if (pkt->stream_index != vidx) {
             av_packet_unref(pkt);
             continue;
@@ -104,7 +142,7 @@ int rtsp_demux_run(RTSPDemux *d, rtsp_demux_data_cb on_data, void *userdata) {
         /* send consumes/moves the packet ref; receive refills pkt. */
         if (av_bsf_send_packet(bsf, pkt) == 0) {
             while (av_bsf_receive_packet(bsf, pkt) == 0) {
-                if (pkt->size > 0) on_data(userdata, pkt->data, pkt->size);
+                if (pkt->size > 0) on_video(userdata, pkt->data, pkt->size);
                 av_packet_unref(pkt);
             }
         } else {
