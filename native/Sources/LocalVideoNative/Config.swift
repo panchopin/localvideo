@@ -20,10 +20,13 @@ struct CameraConfig: Codable, Equatable {
     /// a live RTSPSource) when `showVideoStream || recordVideo`, so recording works
     /// even for a camera hidden from the grid. Defaults to false; backward-compatible.
     var recordVideo: Bool
+    /// Whether to also record audio (decoded G.711 → PCM in a .mov) when recordVideo
+    /// is on. Defaults to false; backward-compatible.
+    var recordAudio: Bool
 
-    enum CodingKeys: String, CodingKey { case id, name, url, username, password, showVideoStream, recordVideo }
+    enum CodingKeys: String, CodingKey { case id, name, url, username, password, showVideoStream, recordVideo, recordAudio }
 
-    init(id: UUID = UUID(), name: String, url: String, username: String? = nil, password: String? = nil, showVideoStream: Bool = true, recordVideo: Bool = false) {
+    init(id: UUID = UUID(), name: String, url: String, username: String? = nil, password: String? = nil, showVideoStream: Bool = true, recordVideo: Bool = false, recordAudio: Bool = false) {
         self.id = id
         self.name = name
         self.url = url
@@ -31,6 +34,7 @@ struct CameraConfig: Codable, Equatable {
         self.password = password
         self.showVideoStream = showVideoStream
         self.recordVideo = recordVideo
+        self.recordAudio = recordAudio
     }
 
     init(from decoder: Decoder) throws {
@@ -43,6 +47,7 @@ struct CameraConfig: Codable, Equatable {
         // Backward compatible: an older file without the key means "shown".
         self.showVideoStream = (try? c.decode(Bool.self, forKey: .showVideoStream)) ?? true
         self.recordVideo = (try? c.decode(Bool.self, forKey: .recordVideo)) ?? false
+        self.recordAudio = (try? c.decode(Bool.self, forKey: .recordAudio)) ?? false
     }
 
     func encode(to encoder: Encoder) throws {
@@ -54,6 +59,7 @@ struct CameraConfig: Codable, Equatable {
         try c.encodeIfPresent(password, forKey: .password)
         try c.encode(showVideoStream, forKey: .showVideoStream)
         try c.encode(recordVideo, forKey: .recordVideo)
+        try c.encode(recordAudio, forKey: .recordAudio)
     }
 
     /// Full RTSP(S) URL with credentials inserted if they were supplied

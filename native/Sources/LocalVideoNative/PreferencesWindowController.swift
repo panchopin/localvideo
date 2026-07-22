@@ -18,6 +18,7 @@ final class PreferencesWindowController: NSWindowController, NSTableViewDataSour
     private let passField = NSSecureTextField()
     private let showStreamCheckbox = NSButton()
     private let recordCheckbox = NSButton()
+    private let recordAudioCheckbox = NSButton()
     private let folderValueLabel = NSTextField(labelWithString: "")
     private let chooseFolderButton = NSButton()
     private let retentionField = NSTextField()
@@ -115,9 +116,18 @@ final class PreferencesWindowController: NSWindowController, NSTableViewDataSour
         recordCheckbox.setButtonType(.switch)
         recordCheckbox.title = "Record video"
         recordCheckbox.frame = NSRect(x: 432, y: 232, width: 172, height: 18)
+        recordCheckbox.target = self
+        recordCheckbox.action = #selector(recordToggled)
         content.addSubview(recordCheckbox)
 
-        errorLabel.frame = NSRect(x: 272, y: 188, width: 332, height: 38)
+        // "Record audio" — sub-option of Record video (indented, only enabled when
+        // Record video is on). Wyze audio is G.711 → saved as PCM in a .mov.
+        recordAudioCheckbox.setButtonType(.switch)
+        recordAudioCheckbox.title = "Record audio"
+        recordAudioCheckbox.frame = NSRect(x: 452, y: 210, width: 152, height: 18)
+        content.addSubview(recordAudioCheckbox)
+
+        errorLabel.frame = NSRect(x: 272, y: 160, width: 332, height: 38)
         errorLabel.textColor = .systemRed
         errorLabel.font = .systemFont(ofSize: 11)
         errorLabel.maximumNumberOfLines = 3
@@ -220,6 +230,7 @@ final class PreferencesWindowController: NSWindowController, NSTableViewDataSour
             passField.stringValue = ""
             showStreamCheckbox.state = .on
             recordCheckbox.state = .off
+            recordAudioCheckbox.state = .off
             setFormEnabled(false)
             errorLabel.stringValue = ""
             return
@@ -231,6 +242,7 @@ final class PreferencesWindowController: NSWindowController, NSTableViewDataSour
         passField.stringValue = cam.password ?? ""
         showStreamCheckbox.state = cam.showVideoStream ? .on : .off
         recordCheckbox.state = cam.recordVideo ? .on : .off
+        recordAudioCheckbox.state = cam.recordAudio ? .on : .off
         errorLabel.stringValue = ""
     }
 
@@ -239,6 +251,13 @@ final class PreferencesWindowController: NSWindowController, NSTableViewDataSour
         showStreamCheckbox.isEnabled = enabled
         recordCheckbox.isEnabled = enabled
         saveButton.isEnabled = enabled
+        // Audio is a sub-option: only settable while Record video is on.
+        recordAudioCheckbox.isEnabled = enabled && recordCheckbox.state == .on
+    }
+
+    /// Keep "Record audio" enabled only while "Record video" is on.
+    @objc private func recordToggled() {
+        recordAudioCheckbox.isEnabled = recordCheckbox.isEnabled && recordCheckbox.state == .on
     }
 
     private func updateButtons() {
@@ -288,7 +307,8 @@ final class PreferencesWindowController: NSWindowController, NSTableViewDataSour
             username: user.isEmpty ? nil : user,
             password: pass.isEmpty ? nil : pass,
             showVideoStream: showStreamCheckbox.state == .on,
-            recordVideo: recordCheckbox.state == .on
+            recordVideo: recordCheckbox.state == .on,
+            recordAudio: recordCheckbox.state == .on && recordAudioCheckbox.state == .on
         )
         showError("")
         app?.applyCameras(list)

@@ -17,8 +17,20 @@ checkbox next to “Show video stream”.
 - Retention: delete anything older than **N hours** (default **48**).
 - Per-camera opt-in (a “Record video” switch), plus a small global settings block
   (base folder, retention hours).
-- **Non-goals (v1):** audio, cloud upload, motion-triggered clips, in-app playback,
-  transcoding/resolution change, exporting.
+- **Non-goals (v1):** cloud upload, motion-triggered clips, in-app playback,
+  video transcoding/resolution change, exporting.
+
+### Audio (added after v1)
+
+Optional per-camera **“Record audio”** sub-toggle. The demuxer (`rtsp_demux.c`) now
+also extracts the audio stream and hands packets + codec info to Swift. Wyze cams
+stream **G.711 A-law** (mono 16 kHz), which MP4 can't hold, so audio recordings are
+written as **`.mov`** with the audio decoded to **16-bit PCM** in-app (`Audio.swift`,
+a lookup-table G.711 expander — no encoder) and muxed as a second `AVAssetWriter`
+track. Audio PTS is anchored to the video session start and kept contiguous per
+segment for smooth, roughly-synced playback. Cameras without audio (or with an
+unsupported codec, e.g. AAC — not yet wired) fall back to video-only `.mp4`. Live
+view stays silent — this is recording-only, so the latency path is untouched.
 
 ## 2. Guiding constraint
 

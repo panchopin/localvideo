@@ -315,7 +315,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private func startCamera(_ cam: CameraConfig) {
         let source = makeSource(cam)
         if cam.recordVideo {
-            let rec = CameraRecorder(cameraName: cam.name, store: recordingStore)
+            let rec = CameraRecorder(cameraName: cam.name, store: recordingStore, recordAudio: cam.recordAudio)
             recorders[cam.id] = rec
             source.recorder = rec
         }
@@ -339,13 +339,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     /// For a camera whose stream stays up, bring its recorder into line with the
     /// config: start one when recording turns on, stop one when it turns off, and
-    /// restart it on rename (so new segments use the new camera name/folder).
+    /// restart it on rename or an audio-toggle change (so new segments pick up the
+    /// new name/folder and audio setting).
     private func reconcileRecorder(_ cam: CameraConfig, old: CameraConfig?) {
         let existing = recorders[cam.id]
         if cam.recordVideo {
-            if existing == nil || old?.name != cam.name {
+            if existing == nil || old?.name != cam.name || old?.recordAudio != cam.recordAudio {
                 existing?.stop()
-                let rec = CameraRecorder(cameraName: cam.name, store: recordingStore)
+                let rec = CameraRecorder(cameraName: cam.name, store: recordingStore, recordAudio: cam.recordAudio)
                 recorders[cam.id] = rec
                 sources[cam.id]?.recorder = rec
             }
@@ -416,7 +417,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             recorders[id]?.stop()
             recorders[id] = nil
             if let cam = cameras.first(where: { $0.id == id }), let src = sources[id] {
-                let rec = CameraRecorder(cameraName: cam.name, store: recordingStore)
+                let rec = CameraRecorder(cameraName: cam.name, store: recordingStore, recordAudio: cam.recordAudio)
                 recorders[id] = rec
                 src.recorder = rec
             }
@@ -776,7 +777,7 @@ func runRecordSelfTest(_ args: [String]) -> Never {
         FileHandle.standardError.write("cannot read \(inPath)\n".data(using: .utf8)!); exit(2)
     }
     let store = RecordingStore(settings: RecordingSettings(directory: outDir, retentionHours: 48, segmentSeconds: seg))
-    let recorder = CameraRecorder(cameraName: "SelfTest", store: store)
+    let recorder = CameraRecorder(cameraName: "SelfTest", store: store, recordAudio: false)
     let parser = H264Parser()
     parser.onSampleBuffer = { sb in recorder.queue.async { recorder.append(sb) } }
 

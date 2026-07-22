@@ -34,7 +34,7 @@ final class RecordingStore {
     /// Build (and create the directory for) the segment paths for a camera at a
     /// given start time. Returns the `.partial` path to write to and the final
     /// `.mp4` path to rename to on finalisation. Nil if the directory can't be made.
-    func segmentPaths(cameraName: String, start: Date) -> (partial: URL, final: URL)? {
+    func segmentPaths(cameraName: String, start: Date, ext: String = "mp4") -> (partial: URL, final: URL)? {
         let safe = Self.sanitize(cameraName)
         let dir = baseDirectory
             .appendingPathComponent(safe, isDirectory: true)
@@ -47,7 +47,7 @@ final class RecordingStore {
             NSLog("RecordingStore: could not create \(dir.path): \(error.localizedDescription)")
             return nil
         }
-        let base = "\(safe)-\(Self.stampFmt.string(from: start)).mp4"
+        let base = "\(safe)-\(Self.stampFmt.string(from: start)).\(ext)"
         let final = dir.appendingPathComponent(base)
         return (final.appendingPathExtension("partial"), final)
     }
@@ -77,7 +77,7 @@ final class RecordingStore {
         for cameraDir in base {
             guard let e = fm.enumerator(at: cameraDir, includingPropertiesForKeys: keys) else { continue }
             for case let url as URL in e {
-                guard url.pathExtension == "mp4" else { continue }          // skip .partial and dirs
+                guard url.pathExtension == "mp4" || url.pathExtension == "mov" else { continue }  // skip .partial and dirs
                 if activePaths.contains(url.path) { continue }
                 let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
                 if let mtime, mtime < cutoff {
