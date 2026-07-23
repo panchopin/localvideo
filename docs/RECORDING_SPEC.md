@@ -1,6 +1,8 @@
 # Continuous Recording — Feature Spec
 
-Status: **proposed** (not yet implemented). Author: design pass, 2026-07.
+Status: **implemented** (shipped in v0.4.0; audio added). This began as a design pass
+(2026-07) and the sections below describe the shipped design. Video-only recordings are
+`.mp4`; recordings with audio are `.mov` (H.264 + PCM) — see the "Audio" section.
 
 Local, continuous, per-camera recording to disk: 60-second segments, organised
 into dated folders, auto-pruned after a retention window. Opt-in per camera via a
