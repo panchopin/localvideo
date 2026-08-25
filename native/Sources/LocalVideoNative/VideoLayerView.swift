@@ -11,7 +11,16 @@ import AVFoundation
 /// queueing clock, which is what keeps latency down.
 final class VideoLayerView: NSView {
 
-    let displayLayer = AVSampleBufferDisplayLayer()
+    /// The render layer. `var`, not `let`: a decode session that macOS has torn down
+    /// can be unrecoverable, and the only cure is a fresh layer (see `recoverDisplay`).
+    private(set) var displayLayer = VideoLayerView.makeDisplayLayer()
+
+    private static func makeDisplayLayer() -> AVSampleBufferDisplayLayer {
+        let l = AVSampleBufferDisplayLayer()
+        l.videoGravity = .resizeAspect   // preserve aspect ratio (letterbox)
+        l.backgroundColor = NSColor.black.cgColor
+        return l
+    }
 
     // MARK: - Zoom-in-place state
     //
@@ -56,12 +65,17 @@ final class VideoLayerView: NSView {
         root.masksToBounds = true   // clips ordinary sublayers (not the video layer — see clipMask)
         layer = root
 
-        displayLayer.videoGravity = .resizeAspect   // preserve aspect ratio (letterbox)
-        displayLayer.backgroundColor = NSColor.black.cgColor
         root.addSublayer(displayLayer)
+        observeDecodeFailures()
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
+
+    /// Tokens for the block-based observers below (`removeObserver(self)` would NOT
+    /// unregister those — the token is the observer, not `self`).
+    private var observerTokens: [NSObjectProtocol] = []
+
+    deinit { observerTokens.forEach(NotificationCenter.default.removeObserver) }
 
     override func layout() {
         super.layout()
@@ -160,22 +174,158 @@ final class VideoLayerView: NSView {
         CATransaction.commit()
     }
 
+    // MARK: - Display health, enqueue & decoder recovery
+    //
+    // The render layer can be knocked out from under a perfectly healthy stream:
+    // macOS revokes decoder resources (app occluded/backgrounded, another process
+    // claims the decoder, sleep/wake) and sets `requiresFlushToResumeDecoding` with
+    // status `.failed`, or a discontinuous/corrupt bitstream trips a decode error.
+    //
+    // Both need a flush to resume — and per AVSampleBufferDisplayLayer's contract the
+    // FIRST buffer after ANY flush must be an IDR (keyframe): a flush discards the
+    // decoder's reference frames, so a P-frame fed to it decodes to nothing. Flushing
+    // and then feeding the next arbitrary frame therefore leaves the picture frozen
+    // until the next keyframe — and if the flush is repeated per frame, forever after.
+    // That is the "recording is perfect but the tile shows ~2 fps" bug: display pinned
+    // to the camera's KEYFRAME rate, while the recorder (which never decodes) is fine.
+    //
+    // So: flush at most once per failure, then gate on the next keyframe, and escalate
+    // to a brand-new layer if a flush didn't take. Nothing here touches the healthy
+    // path — a streaming layer never enters it, and no buffering is added.
+
+    /// Per-interval render counters (see `consumeStats`). Main thread only.
+    struct Stats {
+        var received = 0            // frames handed to us by the parser
+        var enqueued = 0            // frames actually given to the decoder
+        var droppedNotReady = 0     // layer's queue was full (back-pressure)
+        var droppedAwaitingKey = 0  // post-flush, waiting for an IDR (expected, brief)
+        var flushes = 0             // recoveries attempted this interval
+        var rebuilds = 0            // layer replacements this interval
+    }
+
+    private var stats = Stats()
+    /// True after a flush/rebuild: only a keyframe may be enqueued next.
+    private var awaitingKeyframe = false
+    /// Rate-limiting for the decode-error log (it can fire per frame).
+    private var decodeErrorsSinceLog = 0
+    private var lastDecodeErrorLogAt = Date.distantPast
+
+    /// Snapshot and reset the counters. Called ~1 Hz by the app's health timer, which
+    /// compares `received` against `enqueued` to spot a stalled display.
+    func consumeStats() -> Stats {
+        let s = stats
+        stats = Stats()
+        return s
+    }
+
+    /// One-line layer state for diagnostics (goes into the stall log).
+    func layerDiagnostics() -> String {
+        let status: String
+        switch displayLayer.status {
+        case .unknown: status = "unknown"
+        case .rendering: status = "rendering"
+        case .failed: status = "failed"
+        @unknown default: status = "?"
+        }
+        let err = displayLayer.error.map { " error=\($0.localizedDescription)" } ?? ""
+        return "status=\(status) needsFlush=\(displayLayer.requiresFlushToResumeDecoding) ready=\(displayLayer.isReadyForMoreMediaData)\(err)"
+    }
+
     /// Clear the currently displayed frame (e.g. on reconnect) so a stalled
     /// image doesn't linger while the new connection comes up.
     func flushDisplay() {
         displayLayer.flushAndRemoveImage()
+        awaitingKeyframe = true   // post-flush the decoder has no reference frame
+    }
+
+    /// Bring a stalled layer back. `hard` replaces the layer outright — the only cure
+    /// when the decode session is gone for good and `flush()` won't clear `.failed`.
+    /// Either way the next enqueue waits for a keyframe.
+    func recoverDisplay(hard: Bool) {
+        if hard {
+            let old = displayLayer
+            let fresh = VideoLayerView.makeDisplayLayer()
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            fresh.frame = old.frame
+            layer?.insertSublayer(fresh, above: old)
+            old.removeFromSuperlayer()
+            CATransaction.commit()
+            displayLayer = fresh
+            applyGeometry()
+            stats.rebuilds += 1
+        } else {
+            displayLayer.flush()
+            stats.flushes += 1
+        }
+        awaitingKeyframe = true
     }
 
     /// Enqueue a decoded-ready sample buffer for immediate display.
     /// Must be called on the main thread.
     func enqueue(_ sampleBuffer: CMSampleBuffer) {
-        if displayLayer.status == .failed {
-            displayLayer.flush()
+        stats.received += 1
+
+        // Decoder resources revoked or a decode failure: flush ONCE (the keyframe gate
+        // below stops us flushing again on every frame, which would pin the picture to
+        // the keyframe rate) and resume from the next IDR.
+        if !awaitingKeyframe,
+           displayLayer.status == .failed || displayLayer.requiresFlushToResumeDecoding {
+            recoverDisplay(hard: false)
         }
-        if displayLayer.isReadyForMoreMediaData {
-            displayLayer.enqueue(sampleBuffer)
+
+        if awaitingKeyframe {
+            guard VideoLayerView.isKeyframe(sampleBuffer) else {
+                stats.droppedAwaitingKey += 1
+                return
+            }
+            awaitingKeyframe = false
         }
-        // If the layer isn't ready, we simply drop the frame — for a live feed
-        // staying current matters more than showing every frame.
+
+        guard displayLayer.isReadyForMoreMediaData else {
+            // Queue full (decoder behind): drop this frame — for a live feed staying
+            // current beats showing every frame. Deliberately NOT gated on a keyframe
+            // afterwards: the decoder tolerates a gap (brief artifacts, self-healing at
+            // the next IDR), whereas gating here would turn an occasional back-pressure
+            // blip into keyframe-rate video. A SUSTAINED gap is caught by the app's
+            // display-health check, which drives a real recovery.
+            stats.droppedNotReady += 1
+            return
+        }
+
+        displayLayer.enqueue(sampleBuffer)
+        stats.enqueued += 1
+    }
+
+    /// A sample is a keyframe unless it carries the `NotSync` attachment (set by
+    /// H264Parser for non-IDR slices).
+    private static func isKeyframe(_ sb: CMSampleBuffer) -> Bool {
+        guard let atts = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false),
+              CFArrayGetCount(atts) > 0 else { return true }
+        let dict = unsafeBitCast(CFArrayGetValueAtIndex(atts, 0), to: CFDictionary.self)
+        let key = Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque()
+        guard let raw = CFDictionaryGetValue(dict, key) else { return true }
+        return !CFBooleanGetValue(unsafeBitCast(raw, to: CFBoolean.self))
+    }
+
+    /// Log why the layer failed — this is the breadcrumb that names the cause the next
+    /// time a tile degrades in the field. Recovery itself happens on the next frame.
+    private func observeDecodeFailures() {
+        let nc = NotificationCenter.default
+        observerTokens.append(nc.addObserver(forName: .AVSampleBufferDisplayLayerFailedToDecode,
+                       object: nil, queue: .main) { [weak self] note in
+            guard let self, (note.object as AnyObject?) === self.displayLayer else { return }
+            self.decodeErrorsSinceLog += 1
+            guard Date().timeIntervalSince(self.lastDecodeErrorLogAt) >= 5 else { return }
+            let err = note.userInfo?[AVSampleBufferDisplayLayerFailedToDecodeNotificationErrorKey as String] as? NSError
+            NSLog("VideoLayerView: decode failed x\(self.decodeErrorsSinceLog) — \(err?.localizedDescription ?? "?") (\(self.layerDiagnostics()))")
+            self.decodeErrorsSinceLog = 0
+            self.lastDecodeErrorLogAt = Date()
+        })
+        observerTokens.append(nc.addObserver(forName: .AVSampleBufferDisplayLayerRequiresFlushToResumeDecodingDidChange,
+                       object: nil, queue: .main) { [weak self] note in
+            guard let self, (note.object as AnyObject?) === self.displayLayer else { return }
+            NSLog("VideoLayerView: requiresFlushToResumeDecoding changed — \(self.layerDiagnostics())")
+        })
     }
 }

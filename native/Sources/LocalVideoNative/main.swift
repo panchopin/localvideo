@@ -57,6 +57,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private let connectGrace: TimeInterval = 12  // allow this long for the first frame
     private let kickCooldown: TimeInterval = 15  // min gap between auto-reconnects
 
+    // Display-health tracking (see checkDisplayHealth). A tile whose layer has stopped
+    // rendering while frames keep arriving is invisible to the stream-health check
+    // above — `lastFrameAt` is stamped on ARRIVAL, before the display layer gets a say.
+    private var displayDegradedTicks: [UUID: Int] = [:]
+    private var displayRecoveryStreak: [UUID: Int] = [:]
+    private var lastDisplayRecoveryAt: [UUID: Date] = [:]
+
+    private let displayDegradedTicksToRecover = 3   // consecutive bad seconds before acting
+    private let displayRecoveryGrace: TimeInterval = 6  // let a recovered layer find a keyframe
+    private let debugStats = ProcessInfo.processInfo.environment["LOCALVIDEO_DEBUG_STATS"] == "1"
+
     private var layoutMode: LayoutMode = .auto
     private var prefsController: PreferencesWindowController?
 
@@ -335,6 +346,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         lastFrameAt[id] = nil
         sourceStartedAt[id] = nil
         lastKickAt[id] = nil
+        displayDegradedTicks[id] = nil
+        displayRecoveryStreak[id] = nil
+        lastDisplayRecoveryAt[id] = nil
     }
 
     /// For a camera whose stream stays up, bring its recorder into line with the
@@ -368,6 +382,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         recorders[id] = nil
         tilesById[id]?.video.flushDisplay()
         lastKickAt[id] = Date()
+        lastDisplayRecoveryAt[id] = Date()   // the flush above drops frames until the next IDR
         setStatus(.connecting, for: id)
         startCamera(cam)
     }
@@ -447,6 +462,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             if status == .failed, now.timeIntervalSince(lastKickAt[id] ?? .distantPast) >= kickCooldown {
                 reconnect(id: id)   // auto-reconnect stalled/dead stream
             }
+        }
+
+        checkDisplayHealth(now: now)
+    }
+
+    /// Catch a tile that has stopped RENDERING while its stream is perfectly healthy —
+    /// the "recording is fine but the picture updates a couple of times a second"
+    /// failure. The stream check above can't see it: it counts frames as they arrive
+    /// from the demuxer, which is also exactly what the recorder gets, so a dead
+    /// decode session leaves every stream signal green.
+    ///
+    /// Here we compare frames handed to the layer against frames the layer accepted.
+    /// A sustained gap means the decoder is gone, not the camera — so we recover the
+    /// layer (flush → resume at the next keyframe, escalating to a fresh layer if that
+    /// didn't take) instead of pointlessly reconnecting a working RTSP session.
+    private func checkDisplayHealth(now: Date) {
+        for (id, tile) in tilesById {
+            let s = tile.video.consumeStats()
+            if debugStats {
+                tile.setDebugStats(s.received > 0 ? "in \(s.received) → out \(s.enqueued)" : nil)
+                if s.received > 0 {
+                    let name = cameras.first(where: { $0.id == id })?.name ?? "?"
+                    NSLog("LocalVideo[\(name)] stats: in=\(s.received) out=\(s.enqueued) "
+                          + "notReady=\(s.droppedNotReady) awaitingKey=\(s.droppedAwaitingKey) "
+                          + "flushes=\(s.flushes) rebuilds=\(s.rebuilds) \(tile.video.layerDiagnostics())")
+                }
+            }
+
+            // Judge only while frames are actually arriving, and never right after a
+            // recovery (dropping up to one GOP while waiting for an IDR is expected).
+            guard s.received >= 5,
+                  now.timeIntervalSince(lastDisplayRecoveryAt[id] ?? .distantPast) >= displayRecoveryGrace
+            else { displayDegradedTicks[id] = 0; continue }
+
+            guard s.enqueued * 2 < s.received else {   // rendering at least half → healthy
+                displayDegradedTicks[id] = 0
+                displayRecoveryStreak[id] = 0
+                continue
+            }
+
+            let ticks = (displayDegradedTicks[id] ?? 0) + 1
+            displayDegradedTicks[id] = ticks
+            guard ticks >= displayDegradedTicksToRecover else { continue }
+
+            let streak = displayRecoveryStreak[id] ?? 0
+            let name = cameras.first(where: { $0.id == id })?.name ?? "?"
+            NSLog("LocalVideo[\(name)]: display stalled — \(s.enqueued)/\(s.received) frames rendered "
+                  + "(notReady=\(s.droppedNotReady) awaitingKey=\(s.droppedAwaitingKey) "
+                  + "flushes=\(s.flushes) rebuilds=\(s.rebuilds)) \(tile.video.layerDiagnostics()) "
+                  + "— recovering (\(streak > 0 ? "rebuild" : "flush"))")
+            tile.video.recoverDisplay(hard: streak > 0)
+            displayRecoveryStreak[id] = streak + 1
+            lastDisplayRecoveryAt[id] = now
+            displayDegradedTicks[id] = 0
         }
     }
 

@@ -20,6 +20,8 @@ final class CameraTileView: NSView {
     private let nameLabel = NSTextField(labelWithString: "")
     /// The camera name without any zoom suffix (the label may show "Name  2.4×").
     private var baseName: String = ""
+    /// Optional diagnostic counters appended to the label (see `setDebugStats`).
+    private var debugSuffix: String?
     private let statusDot = NSView()
     private let kickButton = NSButton()
     /// Enlarge/restore toggle (same effect as double-click). Icon flips between
@@ -280,12 +282,22 @@ final class CameraTileView: NSView {
     }
 
     /// Reflect the current zoom factor as a suffix on the name label ("Front Door  2.4×");
-    /// shows just the name at exactly 1×.
+    /// shows just the name at exactly 1×. A debug suffix (render counters) is appended
+    /// when enabled.
     private func updateZoomIndicator() {
-        nameLabel.stringValue = video.isZoomed
-            ? String(format: "%@  %.1f×", baseName, video.zoomScale)
-            : baseName
+        var text = baseName
+        if video.isZoomed { text += String(format: "  %.1f×", video.zoomScale) }
+        if let debugSuffix { text += "  " + debugSuffix }
+        nameLabel.stringValue = text
         needsLayout = true
+    }
+
+    /// Show live render counters next to the name (LOCALVIDEO_DEBUG_STATS=1). Pass nil
+    /// to clear. Diagnostic only — nothing in the render path reads this.
+    func setDebugStats(_ text: String?) {
+        guard debugSuffix != text else { return }
+        debugSuffix = text
+        updateZoomIndicator()
     }
 
     func setStatus(_ newStatus: StreamStatus) {
